@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../tgoskits"
+		},
+		{
+			"path": "../"
+		},
+		{
+			"path": "../../tgoskits/os/axvisor"
+		}
+	],
+	"settings": {}
+}
