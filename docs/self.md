@@ -20,3 +20,17 @@ OVMF的复位向量需要放在地址特定位置：0xFFFFFFF0 （即 4GB 物理
 
 
 设置复位向量地址，让vcpu启动去读取那条地址，开始启动OVMF的第一步。
+
+# 进入OVMF阶段发生的异常
+- OVMF 在早期阶段执行到 guest_rip=0x82997a 附近时，先触发了一个 #BR 硬件异常。
+- CPU 随后尝试通过 IDT 投递该异常，但在读取/使用 selector 0x10 的门描述符时又触发了 #GP，导致异常处理链路失败,
+- 最终 VMX 以 exception/nmi exit 形式把这个故障暴露出来。
+## 判断
+- #BR 不是 reset-vector 问题了
+- #BR 也不是 OVMF_CODE 没加载的问题了
+- 它已经进入 OVMF 早期执行后的异常处理阶段
+- 现在真正要查的是：
+  a. RIP=0x82997a 对应 OVMF 里哪段代码
+  b. 当时为什么会触发 #BR
+  c. IDT[0x05] 为什么会走到 selector 0x10
+  d. 0x10 在当前状态下为什么会再触发 #GP
