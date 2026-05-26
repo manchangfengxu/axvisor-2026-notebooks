@@ -270,7 +270,7 @@ AxVisor 当前还不支持这个 string/repeat I/O exit，所以先停在：
 
 ---
 
-## 你可以这样记这次的核心结论
+## 核心结论
 
 - **日志线**：先把 OVMF DEBUG 接出来，才知道跑到了 PEI 和 `QemuFwCfgPei`。
 - **fw_cfg 线**：只做最小适配，不做完整设备模型，先满足 `PlatformPei` 读 `QEMU` / CPU count / `etc/e820`。

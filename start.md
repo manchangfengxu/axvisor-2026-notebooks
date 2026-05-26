@@ -176,9 +176,14 @@ $WORKSPACE/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img
 当前调试默认使用自己编译的 DEBUG OVMF：
 
 ```text
-$WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
-$WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
+$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
+$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
 ```
+
+注意：当前可复现到 `CpuMpPei.efi` 的镜像来自仓库根目录下的 `Build/`。不要和
+`$WORKSPACE/edk2/Build/` 下的旧产物混用；旧 `OVMF_CODE.fd` 可能不包含
+`QemuFwCfgPei.c` 中绕开 `rep insb` 的改动，会退回到
+`VMX unsupported IO-Exit ... port: 0x511`。
 
 原因：
 
@@ -196,19 +201,21 @@ $WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
 export WORKSPACE=/home/ssdns/work/axvisor-uefi
 export EDK2_WORKSPACE="$WORKSPACE/edk2"
 export PACKAGES_PATH="$EDK2_WORKSPACE"
+export BUILD_DIR="$WORKSPACE/Build"
 export EDK_TOOLS_PATH="$EDK2_WORKSPACE/BaseTools"
 export CONF_PATH="$EDK2_WORKSPACE/Conf"
 export PATH="$EDK2_WORKSPACE/BaseTools/BinWrappers/PosixLike:$EDK2_WORKSPACE/BaseTools/Bin/Linux-x86_64:$PATH"
 cd "$EDK2_WORKSPACE"
 . edksetup.sh
-build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC -b DEBUG -n 4
+build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t GCC -b DEBUG -n 4 \
+  --build-dir "$BUILD_DIR"
 ```
 
 构建成功后应生成：
 
 ```text
-$WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
-$WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
+$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
+$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
 ```
 
 ### 5.3 OVMF_CODE 大小和 reset vector
@@ -259,7 +266,7 @@ debugfs -R "dump /guest/ovmf/OVMF_CODE.fd $tmpfile" \
   "$WORKSPACE/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img" >/dev/null 2>&1
 
 sha256sum \
-  "$WORKSPACE/edk2/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd" \
+  "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd" \
   "$tmpfile"
 
 rm -f "$tmpfile"
