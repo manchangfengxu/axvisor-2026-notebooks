@@ -105,3 +105,93 @@
 - 根据 `docs/OVMF-Boot-Overview.md`，当前仍在 **PEI**，更具体是 `CpuMpPei.efi` / AP startup 附近。
 - fw_cfg DMA 不是当前阻塞项；Step 1 的 IA32_APIC_BASE 修复已经能支撑 OVMF 推进到 `CpuMpPei` 后，但还未证明 AP startup 已完成。
 - 下一步应围绕 `CpuMpPei` 的等待点继续加日志或检查 x2APIC/vLAPIC IPI/AP startup 路径，而不是继续排查 `QemuFwCfgInitCache`。
+
+## Step 4：CpuMpPei 后续确认 —— 单 CPU AP handoff 规避后进入 DXE/BDS
+
+### 看到的日志
+- 已重新构建并写入最新 DEBUG OVMF：
+  - host 产物：`$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd`
+  - 写入 rootfs：`$WORKSPACE/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img:/guest/ovmf/OVMF_CODE.fd`
+  - SHA256：`50fb07ad3379e2abaeb19efccd321e088e22c0f602b3de917dc39d292543682d`
+- 使用绝对配置路径运行：
+  - `cargo xtask qemu --config $WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml --qemu-config $WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml --vmconfigs $WORKSPACE/tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml`
+- OVMF 已跨过之前的 PEI `CpuMpPei.efi` 停点，进入 DXE 和 BDS：
+  - `Loading driver at ... PciHostBridgeDxe.efi`
+  - `Loading driver at ... QemuFwCfgAcpiPlatform.efi`
+  - `Loading driver at ... BdsDxe.efi`
+  - `Loading driver at ... PciBusDxe.efi`
+  - `Loading driver at ... VirtioPciDeviceDxe.efi`
+
+### 判断
+- 根据 `docs/OVMF-Boot-Overview.md`，阶段已经从 **PEI** 推进到 **DXE**，并进一步进入 **BDS**。
+- 之前 `CpuMpPei` / AP startup 附近的卡点已经被跨过；`MpInitLib` 单 CPU handoff fallback / APIC ID override 生效。
+- fw_cfg DMA、PEI memory publish、DXE IPL、CpuDxe/MpInitLib 都不再是当前阻塞项。
+
+### 为此做了什么改动
+- EDK2 调试/规避改动：
+  - `edk2/UefiCpuPkg/Library/MpInitLib/MpLib.c`
+    - `WakeUpAP()`：单 CPU 且 Broadcast 时直接跳过 AP 唤醒。
+    - `GetBspNumber()`：单 CPU handoff HOB APIC ID 不匹配时 fallback 到 BSP 0。
+    - `MpInitLibInitialize()`：单 CPU handoff 下用当前 `GetInitialApicId()` / `GetApicId()` 覆盖 CPU info。
+  - `edk2/UefiCpuPkg/Library/BaseXApicX2ApicLib/BaseXApicX2ApicLib.c`
+    - 在 xAPIC/x2APIC IPI 发送路径增加 `AXOVMF SendIpi` 日志。
+
+## Step 5：DXE/BDS 新停点 —— PCI 低端 MMIO 窗口缺失
+
+### 看到的日志
+- 进入 BDS / PCI 设备连接后，AxVisor 反复输出：
+  - `VM[1] run VCpu[0] unhandled vmexit: NestedPageFault { addr: GPA:0x81000000, access_flags: READ }`
+- 在同一次运行中，OVMF 早前已经声明 PCI root bridge 资源：
+  - `RootBridge: PciRoot(0x0)`
+  - `Mem: 80000000 - DFFFFFFF Translation=0`
+  - `MemAbove4G: 380000000000 - 3FFFFFFFFFFF Translation=0`
+- 当时 VM 配置只 passthrough 了：
+  - `0xe000_0000..0xf000_0000`
+  - `IO APIC / Local APIC / HPET`
+
+### 判断
+- 根据 `docs/OVMF-Boot-Overview.md`，这已经处于 **BDS** 阶段：DXE 驱动已加载，BDS 正在连接控制器和启动设备。
+- `0x81000000` 位于 OVMF 给 PCI root bridge 宣告的低端 MMIO window `0x80000000..0xDFFFFFFF`。
+- 因此该停点不是 PEI、fw_cfg、APIC 或 CpuMpPei 问题，而是 PCI 设备 BAR / framebuffer / MMIO 访问落入未映射 GPA，导致 EPT violation。
+
+### 为此做了什么改动
+- AxVisor 侧补充 EPT violation 可见性：
+  - `tgoskits/components/x86_vcpu/src/vmx/vcpu.rs`
+    - 在 `VmxExitReason::EPT_VIOLATION` 分支中返回 `AxVCpuExitReason::NestedPageFault`，否则这类缺页只会落到更模糊的 unhandled exit 路径，难以定位具体 GPA。
+- 在运行配置和模板配置中补充低端 PCI MMIO passthrough：
+  - `tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml`
+  - `tgoskits/os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml`
+- 新增条目：
+  - `["PCI Low MMIO", 0x8000_0000, 0x8000_0000, 0x6000_0000, 0x1]`
+- 同时模板配置补齐此前只存在于 tmp 配置中的高端 PCI MMIO passthrough：
+  - `["PCI MMIO", 0xe000_0000, 0xe000_0000, 0x1000_0000, 0x1]`
+
+## Step 6：低端 PCI MMIO 后复测 —— 已进入 virtio-block，当前停在 BDS 启动设备路径
+
+### 看到的日志
+- 加入 `0x80000000..0xDFFFFFFF` passthrough 后，`GPA:0x81000000` 的 `NestedPageFault` 刷屏消失。
+- OVMF 继续推进到图形和控制台初始化：
+  - `FrameBufferBase: 0x80000000, FrameBufferSize: 0x3E8000`
+  - `Graphics Console Started, Mode: 4`
+  - `PlatformBootManagerAfterConsole`
+- BDS 已发现 virtio-blk 磁盘：
+  - `Found Mass Storage device: PciRoot(0x0)/Pci(0x3,0x0)`
+  - `VirtioBlkInit: LbaSize=0x200[B] NumBlocks=0x200000[Lba]`
+  - `BlockSize : 512`
+  - `LastBlock : 1FFFFF`
+- 之后到 60s timeout 没有新的 debugcon 输出，也没有新的 AxVisor `NestedPageFault` / VMX panic。
+
+### 判断
+- 根据 `docs/OVMF-Boot-Overview.md`，当前处于 **BDS**。
+- 当前已经不是“卡在 OVMF 早期启动”，而是已经到达 BDS 的设备连接/启动项扫描路径。
+- 低端 PCI MMIO 缺口已确认并修复；`0x81000000` 是 Bochs/QEMU display framebuffer 相关低端 BAR 访问，不是当前剩余停点。
+- 新的可疑点有两个：
+  - BDS 没有找到可启动项，停在固件 UI / boot manager 路径，但 nographic 下看不到图形界面。
+  - BDS 正在读 virtio-blk 内容或扫描文件系统，但当前日志不足以确认是否发生了 block read、读到了什么、是否找到 EFI boot 文件。
+
+### 下一步边界
+- 不应继续扩展 APIC / fw_cfg / PEI 范围。
+- 下一步应围绕 BDS 的启动设备路径增加判断信息：
+  - AxVisor 侧：给 virtio-blk MMIO/PCI 或底层 block request 增加一次性/限频日志，确认 OVMF 是否发起磁盘读。
+  - OVMF 侧：必要时给 BDS boot option / SimpleFileSystem / BlockIo 扫描路径加 `AXOVMF` 日志。
+  - 配置侧：确认当前 rootfs 只是 AxVisor 外层 rootfs，不一定包含可由 OVMF 启动的 ESP/EFI 文件；如果要进入 EFI shell 或 Linux EFI，需要给 guest 提供实际可启动介质。

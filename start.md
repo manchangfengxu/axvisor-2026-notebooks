@@ -10,10 +10,12 @@ AxVisor 启动
   -> 为低端 RAM 和高端 OVMF firmware window 建立 GPA -> HPA 映射
   -> 从 AxVisor rootfs 加载 OVMF_CODE / OVMF_VARS
   -> BSP vCPU 从 x86 reset vector 进入 OVMF
-  -> 通过 VM-Exit / debugcon 日志观察 OVMF 后续执行状态
+  -> 通过 PEI / DXE / BDS
+  -> 在 BDS 中发现 PCI / virtio-blk 设备
+  -> 通过 VM-Exit / debugcon 日志观察 OVMF 后续启动设备路径
 ```
 
-当前默认推荐使用自己编译的 DEBUG OVMF。这样能直接看到 `AXOVMF` / `OVMF debugcon` 日志，也能更快把失败点推进到具体的 PEI/DXE 源码位置。
+当前默认推荐使用自己编译的 DEBUG OVMF。这样能直接看到 `AXOVMF` / `OVMF debugcon` 日志，也能更快把失败点推进到具体的 PEI/DXE/BDS 源码位置。
 ---
 
 ## 1. 前置条件
@@ -152,6 +154,18 @@ memory_regions = [
 - `ovmf_vars_base = 0xffc0_0000` 是 OVMF 变量区起始 GPA。
 - `[0xffc0_0000, 0x0040_0000]` 是 4 MiB firmware window，覆盖 OVMF_VARS、OVMF_CODE 和 reset vector。
 
+当前 BDS / PCI 枚举还需要低端 PCI MMIO passthrough，否则 OVMF 访问 framebuffer / BAR 时会在 `0x81000000` 附近触发 `NestedPageFault`：
+
+```toml
+passthrough_devices = [
+  ["PCI Low MMIO", 0x8000_0000, 0x8000_0000, 0x6000_0000, 0x1],
+  ["PCI MMIO", 0xe000_0000, 0xe000_0000, 0x1000_0000, 0x1],
+  ["IO APIC", 0xfec0_0000, 0xfec0_0000, 0x1000, 0x1],
+  ["Local APIC", 0xfee0_0000, 0xfee0_0000, 0x1000, 0x1],
+  ["HPET", 0xfed0_0000, 0xfed0_0000, 0x1000, 0x1],
+]
+```
+
 ---
 
 ## 5. 准备 OVMF 镜像
@@ -180,7 +194,7 @@ $WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
 $WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
 ```
 
-注意：当前可复现到 `CpuMpPei.efi` 的镜像来自仓库根目录下的 `Build/`。不要和
+注意：当前可复现到 BDS / `VirtioBlkInit` 的镜像来自仓库根目录下的 `Build/`。不要和
 `$WORKSPACE/edk2/Build/` 下的旧产物混用；旧 `OVMF_CODE.fd` 可能不包含
 `QemuFwCfgPei.c` 中绕开 `rep insb` 的改动，会退回到
 `VMX unsupported IO-Exit ... port: 0x511`。
@@ -373,20 +387,40 @@ OVMF 内部 DEBUG() 能被宿主机看到
 
 ### 7.4 PEI 阶段进入 QemuFwCfgPei
 
-当前最有用的阶段日志是：
+早期 PEI 验证日志是：
 
 ```text
 OVMF debugcon: AXOVMF InternalQemuFwCfgDmaBytes: size=0x4 buffer=... control=0x2 ...
 ```
 
-如果随后出现：
+历史上如果随后出现：
 
 ```text
 !!!! X64 Exception Type - 05(#BR - BOUND Range Exceeded) !!!!
 Find image based on IP(0x848FA8) ... PlatformPei.dll
 ```
 
-则说明已经进入 **PEI**，并且 failure site 落在 `PlatformPei.efi` 的 `QemuFwCfg` DMA 路径，而不是 reset-vector 附近。
+则说明已经进入 **PEI**，并且 failure site 落在 `PlatformPei.efi` 的 `QemuFwCfg` DMA 路径，而不是 reset-vector 附近。当前代码已跨过该阶段。
+
+### 7.5 DXE / BDS 当前关键日志
+
+当前应能继续看到 DXE 和 BDS 日志：
+
+```text
+OVMF debugcon: Loading driver at ... PciHostBridgeDxe.efi
+OVMF debugcon: Loading driver at ... QemuFwCfgAcpiPlatform.efi
+OVMF debugcon: Loading driver at ... BdsDxe.efi
+OVMF debugcon: Loading driver at ... PciBusDxe.efi
+OVMF debugcon: Loading driver at ... VirtioPciDeviceDxe.efi
+OVMF debugcon: FrameBufferBase: 0x80000000, FrameBufferSize: 0x3E8000
+OVMF debugcon: PlatformBootManagerAfterConsole
+OVMF debugcon: Found Mass Storage device: PciRoot(0x0)/Pci(0x3,0x0)
+OVMF debugcon: VirtioBlkInit: LbaSize=0x200[B] NumBlocks=0x200000[Lba]
+OVMF debugcon: BlockSize : 512
+OVMF debugcon: LastBlock : 1FFFFF
+```
+
+这说明 OVMF 已经进入 **BDS**，并且能发现 PCI display、串口控制台和 virtio-blk 磁盘。
 
 ---
 
@@ -492,7 +526,7 @@ VMX unsupported IO-Exit: VmxIoExitInfo { access_size: 0x1, is_in: false, is_stri
 
 ### 8.6 OVMF 在 PEI 中触发 #BR
 
-当前已观察到的真实 failure 是：
+历史上观察到的 failure 是：
 
 ```text
 OVMF debugcon: AXOVMF InternalQemuFwCfgDmaBytes: size=0x4 buffer=... control=0x2 ...
@@ -500,13 +534,35 @@ OVMF debugcon: AXOVMF InternalQemuFwCfgDmaBytes: size=0x4 buffer=... control=0x2
 Find image based on IP(0x848FA8) ... PlatformPei.dll
 ```
 
-这说明不是 reset-vector 问题，而是 PEI 中 `QemuFwCfgPei` 的 DMA 读路径需要继续定位。
+这说明不是 reset-vector 问题，而是 PEI 中 `QemuFwCfgPei` 的 DMA 读路径需要继续定位。当前代码已经跨过该问题。
+
+### 8.7 BDS 访问 0x81000000 时 NestedPageFault
+
+错误现象：
+
+```text
+VM[1] run VCpu[0] unhandled vmexit: NestedPageFault { addr: GPA:0x81000000, access_flags: READ }
+```
+
+原因：
+
+```text
+OVMF 的 PCI root bridge 宣告低端 MMIO window 为 0x80000000 - 0xDFFFFFFF。
+如果 VM 配置没有映射该窗口，BDS 连接 PCI display / BAR 时会访问未映射 GPA。
+```
+
+处理：
+
+```text
+在 ovmf-x86_64-qemu-smp1.toml 的 passthrough_devices 中加入：
+["PCI Low MMIO", 0x8000_0000, 0x8000_0000, 0x6000_0000, 0x1]
+```
 
 ---
 
 ## 9. 当前运行状态的判断标准
 
-当前阶段的成功标准不是进入 UEFI shell，也不是启动 Linux EFI。
+当前阶段的成功标准不是启动 Linux EFI。
 
 当前阶段的成功标准是：
 
@@ -515,7 +571,9 @@ Find image based on IP(0x848FA8) ... PlatformPei.dll
 2. OVMF_CODE / OVMF_VARS 能从 rootfs 加载到预期 GPA。
 3. BSP vCPU 能以 reset-vector 语义进入 OVMF。
 4. OVMF debugcon 日志能够通过 AxVisor 看到。
-5. 能通过 VM-Exit / exception / debugcon 日志定位 OVMF 下一阶段缺失内容。
+5. OVMF 能跨过 PEI 和 DXE，进入 BDS。
+6. BDS 能发现 PCI / virtio-blk 磁盘，并输出 `VirtioBlkInit` / `BlockSize` / `LastBlock`。
+7. 能通过 VM-Exit / exception / debugcon 日志定位 BDS 启动设备路径的下一阶段缺失内容。
 ```
 
-如果日志已经显示 OVMF 运行到 PEI，并在 `PlatformPei` / `QemuFwCfgPei` 处触发异常，则说明当前最小启动链路已经初步跑通，后续工作应转向定位该异常前的第一条真正指令。
+如果日志已经显示 `Found Mass Storage device: PciRoot(0x0)/Pci(0x3,0x0)` 和 `VirtioBlkInit`，说明当前最小 OVMF 启动链路已经推进到 BDS。后续工作应转向确认 BDS 是否发起磁盘读、是否找到 EFI boot 文件、以及当前 guest 介质是否实际可启动。
