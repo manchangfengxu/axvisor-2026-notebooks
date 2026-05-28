@@ -310,9 +310,96 @@ rm -f "$tmpfile"
 
 如果你没有把文件复制到 rootfs，而是直接在 VM 配置中写宿主机路径，例如 `/usr/share/OVMF/...`，AxVisor 会在自己的 rootfs 中查找该路径，然后报 `NotFound`。
 
+### 5.6 UEFI 可启动验证镜像（FAT32 + GPT + ESP）
+
+上方 Alpine ext4 rootfs 不含 ESP/FAT/`BOOTX64.EFI`，BDS 磁盘启动会报 `Not Found`，然后 fallback 到 PXE。验证完整磁盘启动链路需要换用 UEFI 可启动镜像。
+
+该镜像同时作为 AxVisor rootfs（存放 OVMF firmware）和 OVMF guest 启动盘：
+
+```text
+$WORKSPACE/tmp/uefi-boot-test.img   # 64MB GPT 盘
+  -> Partition 1: EFI System Partition (FAT32)
+       /EFI/BOOT/BOOTX64.EFI         # 当前为 edk2 Shell.efi
+       /guest/ovmf/OVMF_CODE.fd
+       /guest/ovmf/OVMF_VARS.fd
+```
+
+**首次创建：**
+
+```bash
+dd if=/dev/zero of="$WORKSPACE/tmp/uefi-boot-test.img" bs=1M count=64
+sgdisk -o "$WORKSPACE/tmp/uefi-boot-test.img"
+sgdisk -n 1:2048: -t 1:ef00 "$WORKSPACE/tmp/uefi-boot-test.img"
+
+sudo losetup -fP "$WORKSPACE/tmp/uefi-boot-test.img"
+# 假设 loop 为 /dev/loopN，分区为 /dev/loopNp1
+sudo mkfs.fat -F 32 /dev/loopNp1
+sudo mount /dev/loopNp1 /mnt/uefi-test
+sudo mkdir -p /mnt/uefi-test/EFI/BOOT /mnt/uefi-test/guest/ovmf
+
+# 放入 Shell.efi 作为 BOOTX64.EFI
+sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/X64/Shell.efi" \
+  /mnt/uefi-test/EFI/BOOT/BOOTX64.EFI
+# 放入 OVMF firmware
+sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd" \
+  /mnt/uefi-test/guest/ovmf/
+sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd" \
+  /mnt/uefi-test/guest/ovmf/
+
+sudo umount /mnt/uefi-test
+sudo losetup -d /dev/loopN
+```
+
+**仅更新 firmware（不重建镜像）：**
+
+```bash
+sudo losetup -fP "$WORKSPACE/tmp/uefi-boot-test.img"
+sudo mount /dev/loopNp1 /mnt/uefi-test
+sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd" \
+  /mnt/uefi-test/guest/ovmf/
+sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd" \
+  /mnt/uefi-test/guest/ovmf/
+sudo umount /mnt/uefi-test
+sudo losetup -d /dev/loopN
+```
+
 ---
 
 ## 6. 启动命令
+
+在 `tgoskits/os/axvisor` 目录下执行。
+
+### 6.1 默认启动（Alpine ext4 rootfs）
+
+```bash
+cargo xtask qemu \
+  --config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml" \
+  --qemu-config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml" \
+  --vmconfigs "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml"
+```
+
+如果需要避免命令长时间卡住，可以加 `timeout`：
+
+```bash
+timeout 240 cargo xtask qemu \
+  --config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml" \
+  --qemu-config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml" \
+  --vmconfigs "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml"
+```
+
+### 6.2 启动 UEFI 可启动验证镜像
+
+加 `--rootfs` 切换到 FAT32 测试镜像。ostool 会覆盖 QEMU runtime 配置中的 disk image 路径：
+
+```bash
+timeout 240 cargo xtask qemu \
+  --config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml" \
+  --qemu-config "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml" \
+  --vmconfigs "$WORKSPACE/tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml" \
+  --rootfs "$WORKSPACE/tmp/uefi-boot-test.img"
+```
+
+如果不加 `--rootfs`，ostool 自动使用 Alpine ext4 rootfs，OVMF BDS 找不到 ESP 会 fallback 到 PXE。
 
 在 `tgoskits/os/axvisor` 目录下执行：
 
@@ -421,6 +508,23 @@ OVMF debugcon: LastBlock : 1FFFFF
 ```
 
 这说明 OVMF 已经进入 **BDS**，并且能发现 PCI display、串口控制台和 virtio-blk 磁盘。
+
+### 7.6 UEFI Shell 启动成功（使用 FAT32 测试镜像时）
+
+如果使用 5.6 的 UEFI 可启动镜像 + 6.2 的 `--rootfs` 启动，应能看到：
+
+```text
+OVMF debugcon: InstallProtocolInterface: 752F3136-4E16-4FDC-A22A-E5F46812F4CA ...
+UEFI Interactive Shell v2.2
+EDK II
+UEFI v2.70 (EDK II, 0x00010000)
+Mapping table
+      FS0: Alias(s):HD0b:;BLK1:
+          PciRoot(0x0)/Pci(0x3,0x0)/HD(1,GPT,...)
+Shell>
+```
+
+这说明 OVMF BDS 完整链路已跑通：PEI → DXE → BDS → 磁盘启动 → EFI Shell。
 
 ---
 
@@ -558,6 +662,29 @@ OVMF 的 PCI root bridge 宣告低端 MMIO window 为 0x80000000 - 0xDFFFFFFF。
 ["PCI Low MMIO", 0x8000_0000, 0x8000_0000, 0x6000_0000, 0x1]
 ```
 
+### 8.8 忘记 `--rootfs` 导致 BDS 找不到 ESP
+
+错误现象：
+
+```text
+Boot0002: UEFI Misc Device  ->  Not Found
+```
+
+然后 OVMF fallback 到 PXE。
+
+原因：
+
+```text
+没有加 --rootfs，ostool 使用默认 Alpine ext4 rootfs。
+该镜像无 ESP/FAT/BOOTX64.EFI，BDS 磁盘启动失败。
+```
+
+处理：
+
+```text
+启动命令加上 --rootfs "$WORKSPACE/tmp/uefi-boot-test.img"
+```
+
 ---
 
 ## 9. 当前运行状态的判断标准
@@ -573,7 +700,11 @@ OVMF 的 PCI root bridge 宣告低端 MMIO window 为 0x80000000 - 0xDFFFFFFF。
 4. OVMF debugcon 日志能够通过 AxVisor 看到。
 5. OVMF 能跨过 PEI 和 DXE，进入 BDS。
 6. BDS 能发现 PCI / virtio-blk 磁盘，并输出 `VirtioBlkInit` / `BlockSize` / `LastBlock`。
-7. 能通过 VM-Exit / exception / debugcon 日志定位 BDS 启动设备路径的下一阶段缺失内容。
+7. OVMF 能从 virtio-blk 磁盘启动到 UEFI Interactive Shell（`FS0:` mapping 可见，`Shell>` prompt 可交互）。
 ```
 
-如果日志已经显示 `Found Mass Storage device: PciRoot(0x0)/Pci(0x3,0x0)` 和 `VirtioBlkInit`，说明当前最小 OVMF 启动链路已经推进到 BDS。后续工作应转向确认 BDS 是否发起磁盘读、是否找到 EFI boot 文件、以及当前 guest 介质是否实际可启动。
+以上 7 条在当前代码和 FAT32 测试镜像下均已验证通过。
+
+后续工作方向：
+- 正规化 AxVisor 侧的临时修补（nested-DMA descriptor 改写 → virtio-blk device model；ACPI PM I/O passthrough → device model）
+- 替换 `BOOTX64.EFI` 为其他 EFI loader 测试更完整的启动链
