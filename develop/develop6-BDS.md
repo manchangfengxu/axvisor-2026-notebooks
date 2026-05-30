@@ -1,59 +1,21 @@
 ## 本阶段行为准则
+
 - 日志多多益善,确定修改是否正确,通过日志代码定位回源码位置.
 - 每推进一个对主线有意义的小阶段，就更新本文档。
 - 每条记录必须说明：看到什么日志/源码逻辑、判断出现什么问题、根据 `docs/OVMF-Boot-Overview.md` 判断处于哪个阶段（如果进入新的阶段需要写,不进入不写）、为此做了什么改动达到了目标（描述简洁，改动位置定位具体）。
 - 不为了"继续推进"而盲目扩展范围；如果下一步需要大改，就明确记录边界。
+- 保留原有 multiboot / 32-bit entry 兼容性，但它不是本阶段主线。
+- OVMF / EDK2 逻辑代码仍不作为修复对象；允许 debug 输出和 fw_cfg 读入绕开。
+- 每推进一个有意义的小阶段，按 develop 阶段格式追加 Step。
 
 ## 基线
 
-- 本阶段接 `develop5.md` Step 3：AxVisor 已经让标准 OVMF 跨过 PEI `CpuMpPei` / AP startup，进入 DXE 并到达 BDS。
-- 现在主线不再是 CPUID、xAPIC/x2APIC、LAPIC page 接入问题；除非新日志重新指向 APIC/MSR，否则不要回到旧调研分支。
-- 本阶段目标是让 OVMF 在 BDS 中完成设备连接、生成可启动项，并启动一个可验证的 UEFI boot path。
-- OVMF / EDK2 逻辑代码仍不作为修复对象；允许保留当前用于定位的 debug 输出和 fw_cfg 读入绕开。
-- 可信最新运行日志：`/home/ssdns/work/axvisor-uefi/tmp/a.log`。
-- 当前运行命令由 `tgoskits/os/axvisor/` 发起，关键配置为：
-  - `tgoskits/os/axvisor/tmp/configs/qemu-x86_64.toml`
-  - `tgoskits/os/axvisor/tmp/configs/qemu-x86_64-runtime.toml`
-  - `tgoskits/os/axvisor/tmp/configs/ovmf-x86_64-qemu-smp1.toml`
-- 当前 QEMU runtime 里有一个外层 virtio-blk 盘：
-  - `-device virtio-blk-pci,drive=disk0`
-  - `file=/home/ssdns/work/axvisor-uefi/tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img`
-- AxVisor 宿主侧启动时把这个镜像识别成整盘 ext4：
-  - `No partition table found, treating whole disk as single partition`
-  - `Ext4 filesystem mounted`
-  - `Using partition 'disk' (Ext4) as root filesystem`
-- 这说明该镜像目前更像 AxVisor 自己的 rootfs，不一定是 OVMF BDS 可启动的 UEFI 盘；后续不要默认它应该生成 `EFI System Partition` / FAT boot option。
-
-### 当前 BDS 位置
-
-- 根据 `docs/OVMF-Boot-Overview.md`，当前已经进入 **BDS**。
-- 最新日志显示已经走过：
-  - `[Bds] Entry...`
-  - `PlatformBootManagerBeforeConsole`
-  - PCI bus scan / root bridge resource allocation
-  - `OnRootBridgesConnected: root bridges have been connected, installing ACPI tables`
-  - `PlatformBootManagerAfterConsole`
-- 当前最后稳定日志停在 mass storage / virtio-blk 连接附近：
-  - `Found Mass Storage device: PciRoot(0x0)/Pci(0x3,0x0)`
-  - `VirtioBlkInit: LbaSize=0x200[B] NumBlocks=0x200000[Lba]`
-  - `VirtioBlkInit: FirstAligned=0x0[Lba] PhysBlkSize=0x1[Lba]`
-  - `VirtioBlkInit: OptimalTransferLengthGranularity=0x0[Lba]`
-  - `BlockSize : 512`
-  - `LastBlock : 1FFFFF`
-- 之后日志没有继续增长。
-
-### 当前判断
-
-- 现在不是 PXE，也不是 AHCI。旧日志里看到的 `Booting UEFI PXEv4` / AHCI `AtaError` 不能作为当前卡点。
-- OVMF 已经找到 `PciRoot(0x0)/Pci(0x3,0x0)` 的 virtio-blk mass storage，并读到了 Block I/O 几何信息。
-- 当前尚未看到：
-  - `PlatformBdsConnectSequence`
-  - `EfiBootManagerConnectAll`
-  - `Load Options Dumping`
-  - `Boot000x`
-  - `Booting ...`
-- 因此当前卡点先按 BDS 的 **connect mass storage / virtio-blk Block I/O 后续枚举** 处理：重点确认 `VirtioBlkDxe` 安装 Block I/O 后，PartitionDxe / FatDxe 是否继续读取块设备，以及 AxVisor 的 virtio-blk 设备模型是否卡在后续 `ReadBlocks` 请求。
-- 同时要确认当前 guest boot 介质是否本来就不具备 UEFI 可启动结构。如果镜像只有整盘 ext4，没有 GPT/MBR + ESP/FAT + EFI loader，那么即使 virtio-blk 正常，BDS 也未必能生成磁盘启动项。
+- 本阶段接 `develop5.md` Step 3：OVMF 已过 PEI / DXE，进入 BDS。
+- 目标：让 OVMF 在 BDS 完成设备连接，启动一个可验证的 UEFI boot path。
+- 当前卡点：virtio-blk nested-DMA 地址翻译、ACPI PM I/O passthrough、UEFI 可启动镜像。
+- 当前已验证：EFI Shell 和最小 UEFI 应用可从 virtio-blk 启动；Linux EFI stub 解压失败（暂不作为主线）。
+- 三个 AxVisor 侧 patch 需正规化：nested-DMA descriptor 改写、ACPI PM I/O passthrough、fw_cfg bypass。
+- 不回到 APIC/MSR 分支，除非新日志指向那里。
 
 ### Step 1: virtio-blk legacy I/O 已确认进入 queue notify
 

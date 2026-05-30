@@ -16,6 +16,28 @@ AxVisor 启动
 ```
 
 当前默认推荐使用自己编译的 DEBUG OVMF。这样能直接看到 `AXOVMF` / `OVMF debugcon` 日志，也能更快把失败点推进到具体的 PEI/DXE/BDS 源码位置。
+
+当前默认测试组合是：
+
+```text
+DEBUG OVMF:
+  $WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_CODE.fd
+  $WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd
+
+AxVisor / OVMF 共用测试盘:
+  $WORKSPACE/tmp/uefi-boot-test.img
+
+测试盘内:
+  /guest/ovmf/OVMF_CODE.fd
+  /guest/ovmf/OVMF_VARS.fd
+  /EFI/BOOT/BOOTX64.EFI
+
+当前 BOOTX64.EFI:
+  ArceOS UEFI helloworld
+  来源: $WORKSPACE/tgoskits/target/x86_64-unknown-uefi/debug/ax-uefi-helloworld.efi
+```
+
+也就是说，当前默认 smoke 不是进入 EDK2 Shell，而是启动 ArceOS 目录下的最小 UEFI PE32+ 示例。EDK2 Shell 仍可作为回退验证 payload。
 ---
 
 ## 1. 前置条件
@@ -319,7 +341,7 @@ rm -f "$tmpfile"
 ```text
 $WORKSPACE/tmp/uefi-boot-test.img   # 64MB GPT 盘
   -> Partition 1: EFI System Partition (FAT32)
-       /EFI/BOOT/BOOTX64.EFI         # 当前为 edk2 Shell.efi
+       /EFI/BOOT/BOOTX64.EFI         # 当前为 ArceOS UEFI helloworld
        /guest/ovmf/OVMF_CODE.fd
        /guest/ovmf/OVMF_VARS.fd
 ```
@@ -337,7 +359,8 @@ sudo mkfs.fat -F 32 /dev/loopNp1
 sudo mount /dev/loopNp1 /mnt/uefi-test
 sudo mkdir -p /mnt/uefi-test/EFI/BOOT /mnt/uefi-test/guest/ovmf
 
-# 放入 Shell.efi 作为 BOOTX64.EFI
+# 首次创建时可先放入 Shell.efi 作为临时 BOOTX64.EFI；
+# 当前默认 ArceOS UEFI payload 在下方“构建并写入当前 ArceOS UEFI payload”步骤覆盖写入。
 sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/X64/Shell.efi" \
   /mnt/uefi-test/EFI/BOOT/BOOTX64.EFI
 # 放入 OVMF firmware
@@ -361,6 +384,59 @@ sudo cp "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/FV/OVMF_VARS.fd" \
   /mnt/uefi-test/guest/ovmf/
 sudo umount /mnt/uefi-test
 sudo losetup -d /dev/loopN
+```
+
+**构建并写入当前 ArceOS UEFI payload：**
+
+当前默认 `BOOTX64.EFI` 来自 ArceOS 目录下的最小 UEFI 示例：
+
+```bash
+cd "$WORKSPACE/tgoskits"
+cargo build -p ax-uefi-helloworld --target x86_64-unknown-uefi
+```
+
+确认产物应为 PE32+ EFI application：
+
+```bash
+file "$WORKSPACE/tgoskits/target/x86_64-unknown-uefi/debug/ax-uefi-helloworld.efi"
+```
+
+期望类似：
+
+```text
+PE32+ executable (EFI application) x86-64
+```
+
+使用 `mtools` 可不经 sudo 直接写入 FAT32 ESP。当前测试镜像的 ESP 从 sector 2048 开始，因此偏移为 `2048 * 512 = 1048576`：
+
+```bash
+mcopy -o -i "$WORKSPACE/tmp/uefi-boot-test.img@@1048576" \
+  "$WORKSPACE/tgoskits/target/x86_64-unknown-uefi/debug/ax-uefi-helloworld.efi" \
+  ::/EFI/BOOT/BOOTX64.EFI
+```
+
+查看当前 `BOOTX64.EFI`：
+
+```bash
+mdir -i "$WORKSPACE/tmp/uefi-boot-test.img@@1048576" ::/EFI/BOOT
+```
+
+当前 ArceOS UEFI helloworld 的 `BOOTX64.EFI` 大小约为 23 KiB。
+
+**切回 EDK2 Shell payload：**
+
+如果需要回到 `develop6-BDS.md` 中的 Shell 验证，可以写回 EDK2 Shell：
+
+```bash
+mcopy -o -i "$WORKSPACE/tmp/uefi-boot-test.img@@1048576" \
+  "$WORKSPACE/Build/OvmfX64/DEBUG_GCC/X64/Shell.efi" \
+  ::/EFI/BOOT/BOOTX64.EFI
+```
+
+当前也保留了一个明确来源的 Shell 备份：
+
+```text
+$WORKSPACE/tmp/BOOTX64-shell-edk2.efi
 ```
 
 ---
@@ -509,12 +585,32 @@ OVMF debugcon: LastBlock : 1FFFFF
 
 这说明 OVMF 已经进入 **BDS**，并且能发现 PCI display、串口控制台和 virtio-blk 磁盘。
 
-### 7.6 UEFI Shell 启动成功（使用 FAT32 测试镜像时）
+### 7.6 ArceOS UEFI helloworld 启动成功（当前默认 FAT32 测试镜像）
 
 如果使用 5.6 的 UEFI 可启动镜像 + 6.2 的 `--rootfs` 启动，应能看到：
 
 ```text
-OVMF debugcon: InstallProtocolInterface: 752F3136-4E16-4FDC-A22A-E5F46812F4CA ...
+OVMF debugcon: FSOpen: Open '\EFI\BOOT\BOOTX64.EFI' Success
+OVMF debugcon: Loading driver at ... ax_uefi_helloworld-...efi
+ArceOS UEFI helloworld
+OVMF loaded this image as PE32+ EFI application.
+This keeps the legacy multiboot entry untouched.
+UEFI memory map:
+  entries: ...
+  descriptor size: ...
+  descriptor version: ...
+  total memory: ...
+  conventional: ...
+ArceOS UEFI shell-stage boot OK
+```
+
+这说明 OVMF BDS 完整链路已跑通：PEI → DXE → BDS → 磁盘启动 → ArceOS UEFI PE32+ app。
+
+### 7.7 UEFI Shell 启动成功（可选回退 payload）
+
+如果把 `BOOTX64.EFI` 切回 EDK2 Shell，应能看到：
+
+```text
 UEFI Interactive Shell v2.2
 EDK II
 UEFI v2.70 (EDK II, 0x00010000)
@@ -524,7 +620,7 @@ Mapping table
 Shell>
 ```
 
-这说明 OVMF BDS 完整链路已跑通：PEI → DXE → BDS → 磁盘启动 → EFI Shell。
+这说明 EDK2 Shell payload 仍可作为 BDS / virtio-blk / FAT 文件系统路径的回退验证。
 
 ---
 
@@ -700,11 +796,12 @@ Boot0002: UEFI Misc Device  ->  Not Found
 4. OVMF debugcon 日志能够通过 AxVisor 看到。
 5. OVMF 能跨过 PEI 和 DXE，进入 BDS。
 6. BDS 能发现 PCI / virtio-blk 磁盘，并输出 `VirtioBlkInit` / `BlockSize` / `LastBlock`。
-7. OVMF 能从 virtio-blk 磁盘启动到 UEFI Interactive Shell（`FS0:` mapping 可见，`Shell>` prompt 可交互）。
+7. OVMF 能从 virtio-blk 磁盘启动到当前 `BOOTX64.EFI`，默认是 ArceOS UEFI helloworld，并输出 `ArceOS UEFI shell-stage boot OK`。
 ```
 
-以上 7 条在当前代码和 FAT32 测试镜像下均已验证通过。
+以上 7 条在当前代码和 FAT32 测试镜像下均已验证通过。EDK2 Shell 也仍可作为可选 payload 写回 `BOOTX64.EFI` 进行回退验证。
 
 后续工作方向：
 - 正规化 AxVisor 侧的临时修补（nested-DMA descriptor 改写 → virtio-blk device model；ACPI PM I/O passthrough → device model）
-- 替换 `BOOTX64.EFI` 为其他 EFI loader 测试更完整的启动链
+- 将 ArceOS UEFI entry 接入 `axruntime::rust_main(0, boot_context_ptr)`
+- 将 UEFI memory map 转换为 ArceOS `phys_ram_ranges()` / reserved ranges
