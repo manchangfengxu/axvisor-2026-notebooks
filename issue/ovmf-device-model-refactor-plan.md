@@ -1,4 +1,6 @@
-# AxVisor OVMF 设备模型重构计划
+# AxVisor OVMF 设备模型重构计划（精简版）
+
+详细版见 `ovmf-device-model-refactor-plan-detailed.md`。
 
 ## 目标
 
@@ -31,7 +33,7 @@ guest I/O → VM exit → run_vcpu() → get_devices().handle_port_read/write �
 | qemu-exit | 0x42 | 0x604 | 关机信号，用 per-VM AtomicBool |
 | ovmf-virtio-blk | 0x43 | 0x6000-0x6080 | legacy I/O BAR，需 guest memory 引用做 DMA 翻译 |
 
-ACPI PM（0x600-0x60F）保持穿透，不注册为模拟设备。
+ACPI PM（0x600-0x60F）保持穿透，不注册为模拟设备。原因：当前是 host passthrough shim，且端口 0x600-0x60F 与 QEMU exit 0x604 重叠。
 
 ## 新建 crate
 
@@ -61,7 +63,7 @@ emu_devices = [
 ]
 ```
 
-BIOS 配置不声明 fw_cfg 和 ovmf-virtio-blk。debugcon 和 qemu-exit 出现在所有 x86 QEMU 配置中。
+emu_type 使用 0x40..0x43（`#[repr(u8)]`，最大 0xFF）。BIOS 配置不声明 fw_cfg 和 ovmf-virtio-blk。debugcon 和 qemu-exit 出现在所有 x86 QEMU 配置中。
 
 **2. GuestMemoryBytes trait**
 
@@ -74,7 +76,7 @@ pub trait GuestMemoryBytes: Send + Sync {
 }
 ```
 
-设备通过 `Arc<dyn GuestMemoryBytes>` 访问 guest memory，不依赖 axvm 内部类型。
+`translate_and_get_limit` 是 virtio-blk nested DMA 所需。设备通过 `Arc<dyn GuestMemoryBytes>` 访问 guest memory，不依赖 axvm 内部类型。
 
 **3. QemuExitDevice 用 per-VM AtomicBool**
 
@@ -113,7 +115,7 @@ SVM 后续再做。MMIO 设备（vIOAPIC 等）的 EPT 排除逻辑在加入时�
 | Phase | 内容 | 依赖 |
 |-------|------|------|
 | 1 | 新增 GuestMemoryBytes trait + BaseDeviceOps string I/O 方法 | 无 |
-| 2 | VmGuestMemory wrapper + AxVmDevices::new() 签名扩展 + 测试适配 | 1 |
+| 2 | VmGuestMemory wrapper + FwCfgPlatformInfo + AxVmDevices::new() 签名扩展 + 测试适配 | 1 |
 | 3 | 创建 x86_qemu_device crate，搬出 4 个设备 | 2 |
 | 4 | 增加 EmulatedDeviceType 变体（0x40..0x43），TOML 声明设备，init() 注册 | 3 |
 | 5 | 删除 vm.rs inline handler，简化 run_vcpu() | 4 |
