@@ -227,7 +227,7 @@ AxVisor 的 ARM 中断控制器 `arm_vgic` 是独立 crate，因为它是一个�
 
 ### 5.1 新建 `x86_qemu_device` crate
 
-**决策**：在 `components/` 下新建 `x86_qemu_device` crate，包含所有 QEMU x86 平台固有设备。
+**决策**：在 `components/` 下新建 `x86_qemu_device` crate，只放 QEMU 特有设备（debugcon、fw_cfg、qemu_exit、virtio_blk_io）。标准 x86 硬件（vIOAPIC、vLAPIC、PCI 主桥、i8259 等）放在各自独立的 crate 中，和 `arm_vgic`、`riscv_vplic` 平级。所有设备通过同一套 TOML emu_devices + emu_type 机制注册。
 
 **理由**：参考 Cloud Hypervisor 的 `devices/src/legacy/` 模式——fw_cfg、serial、debug_port 等平台设备放在同一个 `devices` crate 中，用文件区分模块。QEMU x86 的这些设备（debugcon、fw_cfg、qemu_exit、virtio_blk_io）都服务于 OVMF/UEFI 启动链条，都是 QEMU 平台固有设备。ACPI PM 保持穿透，不作为模拟设备注册。除 fw_cfg（约 300 行）外，其他设备都很小（10 到 50 行），单独开 crate 过于碎片化。该 crate 与 `arm_vgic`、`riscv_vplic` 平级放在 `components/` 下。
 
