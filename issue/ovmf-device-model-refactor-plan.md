@@ -1,5 +1,81 @@
 # AxVisor OVMF 设备模型重构计划
 
+## 0. 背景知识：虚拟化中的设备访问与拦截
+
+本节为不熟悉虚拟化的同学准备。已了解的同学可跳过。
+
+### 0.1 地址翻译：EPT 是什么
+
+普通操作系统中，CPU 把虚拟地址（VA）翻译成物理地址（PA），页表由 OS 管理。
+
+在虚拟化场景中，Guest OS 以为自己在把 VA 翻译成 PA，但 CPU 实际上会再做一次翻译——把 Guest 的 PA（称为 GPA，Guest Physical Address）翻译成真正的 Host PA（HPA）。这次翻译由 VMM（AxVisor）通过 EPT（Extended Page Tables，Intel VMX 的二级页表）控制。
+
+```text
+Guest 程序看到的：  VA → GPA
+CPU 实际做的：      VA → GPA → HPA
+                           ↑
+                    EPT 页表由 AxVisor 管理
+```
+
+AxVisor 在 EPT 页表中建立 GPA → HPA 的映射关系。Guest 访问一个 GPA 时，CPU 查 EPT 找到 HPA，然后访问真正的物理内存或设备。
+
+### 0.2 设备穿透与模拟的三种机制
+
+Guest 访问设备时，AxVisor 有三种处理方式，取决于设备类型和映射关系：
+
+**穿透（passthrough）—— EPT 有映射**：AxVisor 在 EPT 里把 guest 的设备地址直接映射到外层 QEMU 的物理地址。Guest 访问时 CPU 能翻译，直接落到外层 QEMU 的设备上，AxVisor 不参与，不触发 VM exit。当前 x86 UEFI 的 PCI MMIO、IOAPIC、HPET 走这条路。
+
+**模拟 MMIO 设备 —— EPT 无映射**：AxVisor 不在 EPT 里映射这个地址。Guest 访问时 CPU 翻译不了，触发 EPT violation（类似 page fault，但在虚拟化层），VM exit，AxVisor 收到 `NestedPageFault`，调用 `get_devices().handle_mmio_read/write()` 分发给模拟设备。后续的 vIOAPIC、PCI 配置空间等 MMIO 设备走这条路。
+
+**模拟 port I/O 设备 —— I/O bitmap 标记**：x86 的 IN/OUT 指令访问 I/O 端口（和内存地址空间分开的独立地址空间）。AxVisor 通过 I/O bitmap 控制哪些端口触发 VM exit——bitmap 中标记的端口会被拦截，未标记的直接穿透。当前 x86 UEFI 的 debugcon（0x402）、fw_cfg（0x510）、ACPI PM（0x600）等走这条路。
+
+```text
+穿透设备（PCI MMIO 等）：EPT 有映射 → 不拦截 → 外层 QEMU 处理
+模拟 MMIO 设备：          EPT 无映射 → EPT violation → AxVisor 拦截 → handle_mmio_read/write
+模拟 port I/O 设备：      I/O bitmap 标记 → VM exit → AxVisor 拦截 → handle_port_read/write
+```
+
+### 0.3 AxVisor 设备模型的三层结构
+
+AxVisor 的设备模型由三层 crate 组成：
+
+**第一层：trait 定义**（`axdevice_base`）。定义 `BaseDeviceOps<R>` trait，是所有模拟设备的统一接口。`R` 是地址范围类型，对应三种设备：
+- `BaseMmioDeviceOps` = `BaseDeviceOps<GuestPhysAddrRange>`（MMIO 设备）
+- `BasePortDeviceOps` = `BaseDeviceOps<PortRange>`（port I/O 设备）
+- `BaseSysRegDeviceOps` = `BaseDeviceOps<SysRegAddrRange>`（系统寄存器设备，仅 aarch64）
+
+**第二层：设备注册表**（`axdevice`）。`AxVmDevices` 持有三组设备集合（`emu_mmio_devices`、`emu_port_devices`、`emu_sys_reg_devices`），提供 `handle_mmio_read/write`、`handle_port_read/write` 等分发方法。设备不在这里实现，只在这里注册和分发。
+
+**第三层：设备实现**（独立 crate）。每个设备实现 `BaseDeviceOps` trait。aarch64 的 GIC 在 `arm_vgic` crate，riscv64 的 PLIC 在 `riscv_vplic` crate。本次重构新建的 `x86_qemu_device` crate 放 x86 QEMU 平台设备。
+
+```text
+Guest I/O 访问 → CPU 拦截（EPT violation 或 I/O bitmap）
+  → AxVM::run_vcpu() 收到 exit reason
+  → AxVmDevices::handle_mmio_read/write 或 handle_port_read/write
+  → find_dev() 找到设备
+  → 调用设备的 handle_read/write 方法（在 x86_qemu_device crate 中实现）
+```
+
+### 0.4 当前 x86 UEFI 的穿透与模拟分工
+
+当前 OVMF 启动链路中，部分设备穿透、部分设备模拟：
+
+| 设备 | 地址 | 类型 | 处理方式 | 原因 |
+|------|------|------|---------|------|
+| PCI Low MMIO | 0x8000_0000 | MMIO | 穿透 | OVMF 需要访问外层 QEMU 的 PCI 设备 |
+| PCI MMIO | 0xE000_0000 | MMIO | 穿透 | 同上 |
+| IO APIC | 0xFEC0_0000 | MMIO | 穿透 | 让外层 QEMU 提供中断控制器 |
+| HPET | 0xFED0_0000 | MMIO | 穿透 | 让外层 QEMU 提供定时器 |
+| debugcon | 0x402 | port | 模拟 | OVMF 日志输出，AxVisor 自己处理 |
+| fw_cfg | 0x510-0x51B | port | 模拟 | OVMF 读取固件配置，嵌套场景下外层 QEMU 的 fw_cfg 是给 AxVisor 用的，不是给 guest 用的 |
+| ACPI PM | 0x600-0x60F | port | 模拟 | OVMF 的 ACPI 电源管理访问 |
+| virtio-blk I/O | 0x6000-0x607F | port | 模拟 | OVMF 读磁盘，需要 AxVisor 做 nested DMA 地址翻译 |
+| QEMU exit | 0x604 | port | 模拟 | guest 关机信号，AxVisor 控制 VM 生命周期 |
+
+穿透是临时方案——后续 roadmap 会逐步用模拟设备替换穿透设备，最终 AxVisor 可以独立运行在裸机上。
+
+---
+
 ## 1. 背景与动机
 
 ### 1.1 当前状态
@@ -250,18 +326,29 @@ axvm → axaddrspace（实现 GuestMemoryBytes trait，通过 VmGuestMemory wrap
 
 ### 5.6 QEMU 平台设备的注册方式
 
-**决策**：在 `axdevice/src/device.rs` 的 `init()` 方法中，`#[cfg(target_arch = "x86_64")]` 注册 QEMU 平台设备，但按 `boot_mode` 区分通用设备和 OVMF 专用设备。
+**决策**：QEMU 平台设备通过 TOML 配置的 `emu_devices` 字段声明，和 aarch64 的 GIC 设备使用同一套模式。不在 `axdevice` 代码中硬编码。
 
-具体策略：
-- **始终注册**（所有 x86 QEMU 场景）：debugcon、QemuExit
-- **当前始终注册**（x86-qemu 场景，若非 UEFI 回归发现冲突则收窄到 uefi）：AcpiPm
-- **仅 `boot_mode == "uefi"` 时注册**：FwCfg、OvmfVirtioBlkIo
+**理由**：aarch64 的 GIC 设备已经在 TOML 的 `emu_devices` 中声明（`emu_type = 0x20/0x21/0x22`），`init()` 中按 `emu_type` 匹配实例化。x86 的 QEMU 设备使用同样的模式，保持跨架构一致性。TOML 声明比硬编码更灵活——用户可以在配置文件中增减设备，不需要改代码；配置文件能直接看到 VM 有哪些设备，更透明。
 
-**理由**：注册的地方是"平台知识"——知道 QEMU x86 平台有哪些固有设备。但不同启动模式需要不同设备：fw_cfg 和 OVMF virtio-blk I/O 是 OVMF 专用的，传统 BIOS 启动（如 arceos-x86_64）不需要它们。注册不需要知道端口号——端口号只在设备实现（`x86_qemu_device/src/*.rs`）中定义一次，注册的地方只说"把这个设备加进去"。
+**具体做法**：
+1. 在 `axvmconfig` 的 `EmulatedDeviceType` 枚举中增加 x86 设备类型：`Debugcon`、`FwCfg`、`AcpiPm`、`QemuExit`、`OvmfVirtioBlkIo`
+2. 在 `axdevice/src/device.rs` 的 `init()` 中增加对应的 match 分支，从 `x86_qemu_device` crate 引入设备并实例化
+3. 在 TOML 配置文件中声明设备：
 
-当前不需要平台识别机制，因为 AxVisor 的 x86 场景只有 QEMU。判断依据：`configs/vms/` 下所有 x86_64 配置都是 `*-qemu-*`（arceos、nimbos、ovmf 三个）；`platform/` 下只有 `x86-qemu-q35` 一个 x86 平台包；`vcpu.rs:433` 的 `setup_io_bitmap()` 硬编码了 QEMU exit 端口 0x604，代码本身就假设运行在 QEMU 上。
+```toml
+# ovmf-x86_64-qemu-smp1.toml
+emu_devices = [
+    ["debugcon",       0x402,  0x1,  0, 0x100, []],
+    ["fw-cfg",         0x510,  0xC,  0, 0x101, []],
+    ["acpi-pm",        0x600,  0x10, 0, 0x102, []],
+    ["qemu-exit",      0x604,  0x4,  0, 0x103, []],
+    ["ovmf-virtio-blk",0x6000, 0x80, 0, 0x104, []],
+]
+```
 
-如果未来要支持其他 x86 平台（裸机、其他 hypervisor），只需在 `init()` 中加一个平台判断条件，把 `#[cfg(x86_64)]` 改为更细粒度的条件。这个改动很小，不影响当前重构的架构。
+BIOS 启动配置（如 `arceos-x86_64-qemu-smp1.toml`）不写 fw_cfg 和 ovmf-virtio-blk，自然就不会注册。不需要 `boot_mode` 条件判断——配置本身就是区分。
+
+**guest_mem 和 shutdown_flag 的传递**：这两个运行时依赖无法在 TOML 中声明。仍然通过 `AxVmDevices::new(config, guest_mem, shutdown_flag)` 传入。`init()` 在实例化需要这些参数的设备时（如 FwCfg 需要 guest_mem，QemuExit 需要 shutdown_flag），从参数中获取。`boot_mode` 参数不再需要——配置文件的 `emu_devices` 内容已经隐含了启动模式。
 
 ### 5.7 未注册端口的处理策略
 
@@ -282,7 +369,7 @@ axvm → axaddrspace（实现 GuestMemoryBytes trait，通过 VmGuestMemory wrap
 
 AxVisor 启动时读取 TOML 配置文件 `ovmf-x86_64-qemu-smp1.toml`。`axvmconfig` crate 将 TOML 解析为 `AxVMCrateConfig` 结构体。该结构体包含三个段：`[base]` 段提供 VM 基本信息（id、cpu_num），`[kernel]` 段提供 UEFI 启动参数（OVMF 路径、内存布局），`[devices]` 段提供设备配置。
 
-`[devices]` 段中的 `emu_devices` 字段为空——QEMU 平台设备不在 TOML 中声明，而是在代码中自动注册。`passthrough_devices` 字段包含四个穿透条目（PCI Low MMIO、PCI MMIO、IO APIC、HPET），这些地址范围将被标记为穿透，guest 访问时直接落到外层 QEMU。
+`[devices]` 段中的 `emu_devices` 字段声明了 QEMU 平台设备（debugcon、fw_cfg、acpi_pm、qemu_exit、ovmf-virtio-blk），每个设备指定名称、地址范围和 emu_type。`passthrough_devices` 字段包含四个穿透条目（PCI Low MMIO、PCI MMIO、IO APIC、HPET），这些地址范围将被标记为穿透，guest 访问时直接落到外层 QEMU。BIOS 启动配置的 `emu_devices` 不包含 fw_cfg 和 ovmf-virtio-blk。
 
 `axvm` crate 将 `AxVMCrateConfig` 转换为运行时配置 `AxVMConfig`。该配置包含 `OvmfInfo`（OVMF 代码和变量区的 GPA 地址）和 `VMImageConfig`（内核、BIOS、OVMF 的加载地址）。
 
@@ -290,18 +377,15 @@ AxVisor 启动时读取 TOML 配置文件 `ovmf-x86_64-qemu-smp1.toml`。`axvmco
 
 `AxVmDevices::new(config)` 被调用，进入 `init()` 方法。该方法遍历 `emu_devices` 列表——当前为空，跳过。然后遍历 `passthrough_devices` 列表，将每个穿透条目的地址范围注册到穿透表中。
 
-在 x86_64 架构下，`init()` 还会自动注册 QEMU 平台设备。这些设备从新建的 `x86_qemu_device` crate 引入，通过 `add_port_dev()` 注册到端口设备注册表中。注册按 `boot_mode` 区分：
+`init()` 遍历 `emu_configs` 列表，按 `emu_type` 匹配设备类型并实例化。每个设备从新建的 `x86_qemu_device` crate 引入，通过 `add_port_dev()` 注册到端口设备注册表中。以 OVMF 配置为例，注册的设备包括：
 
-**所有 x86 QEMU 场景始终注册**：
-- `OvmfDebugConDevice` 注册端口 0x402
-- `AcpiPmDevice` 注册端口 0x600 到 0x60F
-- `QemuExitDevice` 注册端口 0x604
+- `OvmfDebugConDevice`（emu_type=0x100）注册端口 0x402
+- `FwCfgDevice`（emu_type=0x101）注册端口 0x510 到 0x51B
+- `AcpiPmDevice`（emu_type=0x102）注册端口 0x600 到 0x60F
+- `QemuExitDevice`（emu_type=0x103）注册端口 0x604
+- `OvmfVirtioBlkIoDevice`（emu_type=0x104）注册端口 0x6000 到 0x607F
 
-**仅 `boot_mode == "uefi"` 时额外注册**：
-- `FwCfgDevice` 注册端口 0x510 到 0x51B
-- `OvmfVirtioBlkIoDevice` 注册端口 0x6000 到 0x607F
-
-每个设备在注册时声明自己需要拦截的端口范围。这些端口范围随后会被用于 I/O bitmap 的自动配置。
+BIOS 启动配置的 `emu_devices` 不包含 FwCfg 和 OvmfVirtioBlkIo，因此不会注册这些设备。每个设备在注册时声明自己需要拦截的端口范围，这些端口范围随后会被用于 I/O bitmap 的自动配置。
 
 ### 6.3 阶段三：vCPU 创建与 I/O bitmap 配置
 
@@ -391,8 +475,8 @@ fn handle_string_write(
 **修改内容**：
 1. 在 axvm 中新建 `VmGuestMemory` wrapper（实现 `GuestMemoryBytes`，持有 `Arc<Mutex<AxVMInnerMut>>`）
 2. `AxVM` 创建 `Arc<AtomicBool>` 作为 per-VM shutdown flag
-3. `AxVmDevices::new()` 签名扩展为 `new(config, boot_mode, guest_mem, shutdown_flag)`
-4. `axvm/src/vm.rs` 的 VM 创建流程中，将 `boot_mode`（从 config）、`guest_mem`（`VmGuestMemory` 的 Arc）、`shutdown_flag`（新建）传入 `AxVmDevices::new()`
+3. `AxVmDevices::new()` 签名扩展为 `new(config, guest_mem, shutdown_flag)`
+4. `axvm/src/vm.rs` 的 VM 创建流程中，将 `guest_mem`（`VmGuestMemory` 的 Arc）、`shutdown_flag`（新建）传入 `AxVmDevices::new()`
 5. `run_vcpu()` 保留 shutdown flag 引用，循环末尾检查
 6. `AxVmDevices::init()` 暂时不改注册逻辑——只接收新参数，注册逻辑在 Phase 6 改
 
@@ -520,20 +604,32 @@ if shutdown_flag.load(Ordering::Acquire) {
 
 ### Phase 6: 设备注册统一化
 
-**文件**: `components/axdevice/src/device.rs`
+**文件**: `components/axdevice/src/device.rs`、`components/axvmconfig/src/lib.rs`
 
-**前提**：Phase 2 已完成 `AxVmDevices::new()` 签名扩展和参数传递。本 Phase 只改 `init()` 内部的注册逻辑。
+**前提**：Phase 2 已完成 `AxVmDevices::new()` 签名扩展和参数传递。本 Phase 改 `init()` 的注册逻辑和 `EmulatedDeviceType` 枚举。
 
-**修改 `init()` 注册逻辑**：
-- x86_64 分支：始终注册 debugcon、QemuExit（用 shutdown_flag）；AcpiPm 当前也始终注册（若非 UEFI 回归发现冲突则收窄到 uefi）
-- x86_64 + `boot_mode == "uefi"` 分支：额外注册 FwCfg（用 guest_mem）、OvmfVirtioBlkIo（用 guest_mem）
-- 未注册端口：port read 返回默认值（0xFF/0xFFFF/0xFFFFFFFF），port write ignore + warn 日志（详见 5.7 节）
+**修改 `EmulatedDeviceType` 枚举**（`axvmconfig/src/lib.rs`）：
+增加 x86 QEMU 设备类型：`Debugcon`、`FwCfg`、`AcpiPm`、`QemuExit`、`OvmfVirtioBlkIo`
 
-### Phase 7: 配置支持（可选）
+**修改 `init()` 注册逻辑**（`axdevice/src/device.rs`）：
+遍历 `emu_configs` 列表，按 `emu_type` 匹配新增的 x86 设备类型，从 `x86_qemu_device` crate 引入设备并实例化：
+- `Debugcon` → `OvmfDebugConDevice::new()`
+- `FwCfg` → `FwCfgDevice::new(guest_mem.clone())`
+- `AcpiPm` → `AcpiPmDevice::new()`
+- `QemuExit` → `QemuExitDevice::new(shutdown_flag.clone())`
+- `OvmfVirtioBlkIo` → `OvmfVirtioBlkIoDevice::new(guest_mem.clone())`
 
-**文件**: `components/axvmconfig/src/lib.rs`
+**修改 TOML 配置**（`ovmf-x86_64-qemu-smp1.toml`）：
+在 `emu_devices` 中声明 QEMU 设备。BIOS 启动配置不声明 fw_cfg 和 ovmf-virtio-blk。
 
-**可选修改**：在 `VMBaseConfig` 中增加 `platform: Option<String>` 字段。现有 TOML 不写此字段则为 `None`，向后兼容。
+**未注册端口**：port read 返回默认值（0xFF/0xFFFF/0xFFFFFFFF），port write ignore + warn 日志（详见 5.7 节）
+
+### Phase 7: 回归验证
+
+**验证**：
+- `arceos-x86_64-qemu-smp1.toml` 的 `emu_devices` 不含 QEMU 设备，BIOS 启动正常
+- `ovmf-x86_64-qemu-smp1.toml` 的 `emu_devices` 含 QEMU 设备，UEFI 启动正常
+- `nimbos-x86_64-qemu-smp1.toml` 的 `emu_devices` 不含 QEMU 设备，BIOS 启动正常
 
 ---
 
@@ -557,7 +653,8 @@ if shutdown_flag.load(Ordering::Acquire) {
 | `components/axvm/Cargo.toml` | 修改 | 3 | 增加 x86_qemu_device 依赖 |
 | `components/x86_vcpu/src/vmx/vcpu.rs` | 修改 | 5 | setup_io_bitmap() 改为从设备注册读取 |
 | `components/x86_vcpu/Cargo.toml` | 修改 | 5 | 增加 axdevice 依赖 |
-| `components/axvmconfig/src/lib.rs` | 可选修改 | 7 | 增加 platform 字段 |
+| `components/axvmconfig/src/lib.rs` | 修改 | 6 | 增加 x86 QEMU 设备的 `EmulatedDeviceType` 枚举变体 |
+| `os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml` | 修改 | 6 | 在 `emu_devices` 中声明 QEMU 设备 |
 
 ---
 
@@ -576,7 +673,7 @@ if shutdown_flag.load(Ordering::Acquire) {
 |------|------|-------|------|-----------|------|
 | 1 | 新增 GuestMemoryBytes 子 trait + 为 AddrSpace 实现 | 1 | 无 | 小 | object-safe 的 guest memory 抽象 |
 | 2 | 扩展 BaseDeviceOps 增加 string I/O 方法 | 1 | 1 | 小 | 加两个默认方法，零影响 |
-| 3 | 建立参数传递链路 | 2 | 1, 2 | 中 | 新建 VmGuestMemory wrapper，AxVmDevices::new() 扩展签名，参数从 VM 层传入 |
+| 3 | 建立参数传递链路 | 2 | 1, 2 | 中 | 新建 VmGuestMemory wrapper，AxVmDevices::new(config, guest_mem, shutdown_flag) |
 | 4 | 创建 x86_qemu_device crate 骨架 | 3.1 | 3 | 小 | Cargo.toml + lib.rs |
 | 5 | 搬出 debugcon 到 x86_qemu_device | 3.2, 3.7 | 4 | 小 | 约 30 行，最简单的设备 |
 | 6 | 搬出 fw_cfg 到 x86_qemu_device | 3.3 | 4 | 中 | 约 300 行，持有 GuestMemoryBytes 引用 |
@@ -585,8 +682,8 @@ if shutdown_flag.load(Ordering::Acquire) {
 | 9 | 创建 QemuExitDevice | 3.6 | 4 | 小 | 约 10 行，持有 per-VM shutdown flag |
 | 10 | 清理 vm.rs，删除内联设备代码 | 4 | 5,6,7,8,9 | 中 | 删除约 500 行，简化 run_vcpu() |
 | 11 | I/O bitmap 自动联动 | 5 | 2 | 小 | setup_io_bitmap() 改为从设备读取 |
-| 12 | 设备注册统一化 | 6 | 10 | 中 | init() 改为按 boot_mode 条件注册 |
-| 13 | 配置支持（platform 字段） | 7 | 12 | 小 | 可选，向后兼容 |
+| 12 | 设备注册统一化 | 6 | 10 | 中 | 增加 EmulatedDeviceType 变体，init() 按 emu_type 匹配实例化，TOML 声明设备 |
+| 13 | 回归验证 | 7 | 12 | 小 | BIOS 和 UEFI 配置分别验证 |
 
 **关键路径**：1 → 2 → 3 → 4 → 5/6/7/8/9（可并行） → 10 → 11 → 12 → 13
 
