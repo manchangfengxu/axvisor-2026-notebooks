@@ -1,0 +1,401 @@
+# rebase 后的 virtio-blk nested DMA 架构
+
+本文记录 2026-06-14 重新检查并恢复 `tgoskits` 后的架构。旧的 `00-design.md`、`01-implementation.md`、`02-fix-hpa-hva.md` 是变基前写的，代码后来丢了；这份文档以当前 `uefi-develop` 为准。
+
+当前分支关系：
+
+- `tgoskits/dev` 等同 `upstream/dev`，当作纯上游基线。
+- `tgoskits/uefi-develop` 比 `dev` 多 7 个提交，作者是 `manchangfengxu` 和 `l`。这些是我们的 UEFI bring-up 补丁，不算上游已经吸收。
+- 当前工作目录在 `uefi-develop`。检查上游能力时对照 `dev`，实现修改落在 `uefi-develop`。
+
+## 这次上游已经补好的部分
+
+相比旧笔记里的代码状态，新的上游基础设施已经补了不少东西。
+
+1. 配置链更完整
+
+   文件：
+
+   - `tgoskits/virtualization/axvmconfig/src/lib.rs`
+   - `tgoskits/virtualization/axvm/src/config.rs`
+   - `tgoskits/os/axvisor/src/config.rs`
+   - `tgoskits/os/axvisor/src/images/mod.rs`
+
+   已有字段和路径：
+
+   - `VMKernelConfig::boot`
+   - `VMKernelConfig::boot_protocol`
+   - `VMKernelConfig::uefi_firmware_path`
+   - `VMKernelConfig::ovmf_code_path`
+   - `VMKernelConfig::ovmf_code_base`
+   - `VMKernelConfig::ovmf_vars_path`
+   - `VMKernelConfig::ovmf_vars_base`
+   - `VMKernelConfig::reset_vector`
+   - `OvmfInfo`
+   - `ImageLoader::load_uefi_ovmf_images()`
+
+   结论：不要再重做 UEFI 配置链。恢复 virtio-blk 时只补 `disk_path` 的消费路径。
+
+2. guest memory 访问接口已经存在
+
+   文件：
+
+   - `tgoskits/virtualization/axaddrspace/src/memory_accessor.rs`
+
+   关键接口：
+
+   - `trait GuestMemoryAccessor`
+   - `GuestMemoryAccessor::read_obj()`
+   - `GuestMemoryAccessor::write_obj()`
+   - `GuestMemoryAccessor::read_buffer()`
+   - `GuestMemoryAccessor::write_buffer()`
+
+   这个接口正好适合 virtqueue nested DMA。设备模型可以继续用 GPA，不需要把 descriptor table 里的地址改成 HPA。
+
+   注意：`translate_and_get_limit()` 的返回值会被默认 `read_buffer()` 当成可解引用地址。AxVM 侧实现这个 trait 时，不能直接返回 HPA，必须返回 direct-map HVA 对应的数值。旧笔记 `02-fix-hpa-hva.md` 的判断仍然有效。
+
+3. x86 平台设备比以前多
+
+   文件：
+
+   - `tgoskits/virtualization/axvm-types/src/lib.rs`
+   - `tgoskits/virtualization/axdevice/src/device.rs`
+   - `tgoskits/virtualization/x86_vlapic/src/vioapic.rs`
+   - `tgoskits/virtualization/x86_vlapic/src/pit.rs`
+   - `tgoskits/virtualization/x86_vlapic/src/serial.rs`
+   - `tgoskits/virtualization/axvm/src/runtime/x86_irq.rs`
+
+   已有类型和接线：
+
+   - `EmulatedDeviceType::X86IoApic`
+   - `EmulatedDeviceType::X86Pit`
+   - `EmulatedDeviceType::Console`
+   - `AxVmDevices::x86_ioapic_assert_gsi()`
+   - `AxVmDevices::x86_ioapic_end_of_interrupt()`
+   - `AxVmDevices::x86_pit_consume_irq0_if_due()`
+   - `AxVmDevices::x86_serial_poll_irq()`
+   - `runtime::x86_irq`
+
+   结论：短期 virtio-blk 仍然可以先不注入中断，让 OVMF polling 跑通。后面要接 INTx 时，可以直接复用 `x86_ioapic_assert_gsi()` 这条路，不用从零写 vIOAPIC。
+
+4. virtio 类型枚举已经预留
+
+   文件：
+
+   - `tgoskits/virtualization/axvm-types/src/lib.rs`
+
+   已有枚举：
+
+   - `EmulatedDeviceType::VirtioBlk`
+   - `EmulatedDeviceType::VirtioNet`
+   - `EmulatedDeviceType::VirtioConsole`
+
+   但这只是配置类型。上游还没有实现 virtio-blk 设备模型，也没有把它接进 `AxVmDevices::init()`。
+
+## 本次恢复的部分
+
+这些内容已经在当前工作区恢复。
+
+1. AxVisor 自己的 virtio-blk 设备模型
+
+   文件：
+
+   - `tgoskits/virtualization/axdevice/src/virtio_blk.rs`
+
+   关键符号：
+
+   - `LegacyVirtioBlk`
+   - `LegacyQueue`
+   - `VirtioBlkRequest`
+   - `Descriptor`
+
+   当前实现是 legacy split queue，一个 queue，内存后端。它处理：
+
+   - `VIRTIO_BLK_T_IN`
+   - `VIRTIO_BLK_T_OUT`
+   - `VIRTIO_BLK_T_GET_ID`
+
+   旧的 descriptor 改写路径已经删除。现在 AxVisor 自己读写 virtqueue，不再把 guest descriptor 里的 GPA 改成 HPA。
+
+2. `disk_path` 已经接入
+
+   文件：
+
+   - `tgoskits/os/axvisor/src/images/mod.rs`
+   - `tgoskits/os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml`
+
+   当前路径：
+
+   - `kernel.disk_path = "/guest/disks/uefi-boot-test.img"`
+   - `ImageLoader::load_virtio_blk_disk_from_filesystem()`
+   - `fs::read_image_file()`
+   - `AxVM::install_virtio_blk_disk_image()`
+   - `LegacyVirtioBlk::install_disk_image()`
+
+   raw disk 读进内存后交给设备模型。当前不会把写请求回写到 rootfs 文件。
+
+3. VMX/SVM 的 OVMF 端口拦截补齐
+
+   文件：
+
+   - `tgoskits/virtualization/x86_vcpu/src/vmx/vcpu.rs`
+   - `tgoskits/virtualization/x86_vcpu/src/svm/vcpu.rs`
+
+   VMX 已经拦截：
+
+   - `0x402`
+   - `0x510..0x512`
+   - `0x514..0x51c`
+   - `0x6000..0x6080`
+
+   本次把 SVM 也补到同一组端口。否则 AMD/SVM 路径下 debugcon、fw_cfg 和 virtio-blk 都可能不会退出到 AxVM。
+
+4. 设备框架还没有方向二需要的上下文接口
+
+   现有接口：
+
+   - `BaseDeviceOps::handle_read(addr, width)`
+   - `BaseDeviceOps::handle_write(addr, width, val)`
+
+   它没有 `GuestMemoryAccessor`，也没有 `IrqSink`。所以本阶段不要硬把 virtio-blk 注册成普通 `BasePortDeviceOps`。否则要提前改公共 trait，范围会变大，也容易和方向二冲突。
+
+## 最终架构
+
+本次只拆一小层。没有新建 `axvirtio_blk` crate，也没有把 virtio-blk 放回 `axvm/src/virtio_blk/`。
+
+当前只用一个文件：
+
+```text
+tgoskits/virtualization/axdevice/src/virtio_blk.rs
+```
+
+当前功能不多，单文件更容易审。后面如果要加中断、配置空间细节、多队列，再拆出 `queue.rs` 和 `backend.rs`。
+
+模块职责：
+
+- `LegacyVirtioBlk` 处理 legacy I/O BAR `0x6000..0x607f`。
+- `LegacyQueue` 保存 `queue_pfn`、`queue_size`、`last_avail_idx`，按 GPA 读取 descriptor table、avail ring、used ring。
+- `VirtioBlkRequest` 负责解析 descriptor chain。
+- `LegacyVirtioBlk::disk` 持有 `Vec<u8>`。读写请求只修改内存里的 raw disk，不回写 rootfs 文件。
+
+AxVM 只保留胶水：
+
+- `AxVMInnerMut::ovmf_virtio_blk: LegacyVirtioBlk`
+- `struct AxVmGuestMemory<'a>`
+- `impl GuestMemoryAccessor for AxVmGuestMemory<'_>`
+- `AxVM::install_virtio_blk_disk_image()`
+- `AxVM::handle_ovmf_virtio_blk_io_read()`
+- `AxVM::handle_ovmf_virtio_blk_io_write()`
+
+AxVM 侧 `handle_ovmf_virtio_blk_io_write()` 在 notify 时构造 `AxVmGuestMemory`，然后调用设备：
+
+```text
+OVMF out 0x6010
+  -> AxVM::handle_ovmf_virtio_blk_io_write()
+  -> LegacyVirtioBlk::handle_write(port, width, value, &guest_memory)
+  -> LegacyQueue::pop_available()
+  -> LegacyQueue::collect_chain()
+  -> VirtioBlkRequest::from_chain()
+  -> LegacyVirtioBlk::execute_read/write/get_id()
+  -> GuestMemoryAccessor::write_buffer()
+  -> LegacyQueue::publish_used()
+```
+
+本阶段仍然不注入中断。OVMF legacy virtio-blk 路径可以 polling，之前 smoke 已经验证过这点。等读盘稳定后，再用 `AxVmDevices::x86_ioapic_assert_gsi()` 补 INTx。
+
+## 和方向二的兼容边界
+
+方向二未来会把设备访问整理成类似 `BusAccess + DeviceContext + IrqSink` 的结构。当前上游还没有这个接口，所以方向一不要等它。
+
+为了以后好迁移，本阶段保留这几个边界：
+
+- `LegacyVirtioBlk` 不依赖 `AxVM`。
+- `LegacyVirtioBlk` 只通过 `GuestMemoryAccessor` 访问 guest memory。
+- `LegacyVirtioBlk` 不直接碰 vLAPIC、vIOAPIC 或 vCPU。
+- `disk_path` 的读取放在 `os/axvisor/src/images/mod.rs`，设备只接收 `Vec<u8>`。
+- `AxVM` 里的特殊 I/O 分发只当临时适配层，后续 `DeviceContext` 出来后可以删。
+
+这样后续迁移只需要把：
+
+```text
+AxVM 手动构造 AxVmGuestMemory
+```
+
+替换成：
+
+```text
+DeviceContext::guest_memory
+```
+
+设备内部的 virtqueue、request、backend 逻辑不用重写。
+
+## 可以借鉴的现成实现
+
+不要自己死磕复杂 virtio 代码。当前只做 legacy split queue 的最小 block 设备，可以借鉴两处：
+
+- `references/cloud-hypervisor/virtio-devices/src/block.rs`
+- `references/cloud-hypervisor/vm-virtio/src/queue.rs`
+
+Cloud Hypervisor 的实现比我们当前需要的大很多。可借鉴的是边界：
+
+- block 设备自己解析 request。
+- queue 逻辑和 backend I/O 分开。
+- 设备通过 guest memory 抽象读写 descriptor、data buffer 和 used ring。
+
+不需要照搬的内容：
+
+- async I/O
+- epoll worker
+- rate limiter
+- migration
+- multi-queue
+- packed queue
+- MSI/MSI-X
+- discard/write zeroes
+
+当前只需要：
+
+- legacy split queue
+- 一个 queue
+- read/write/get-id
+- polling
+- memory backend
+
+## 验收点
+
+恢复后先跑小闭环，不要一次追 Linux EFI。
+
+代码检查：
+
+```bash
+rg "rewrite desc|rewrite_ovmf|translated_queue_pfn|translate_ovmf_virtio_blk_queue_pfn|OvmfVirtioBlkIoState" tgoskits/virtualization tgoskits/os
+cargo fmt --check --package axdevice --package axvm --package axvisor
+cargo test -p axdevice virtio_blk -- --nocapture
+cargo test -p axvm --lib
+cargo run --manifest-path xtask/Cargo.toml -- axvisor build --config os/axvisor/configs/board/qemu-x86_64.toml --vmconfigs os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml
+```
+
+smoke 目标：
+
+```text
+Loading virtio-blk disk image from /guest/disks/uefi-boot-test.img
+VirtioBlkInit: LbaSize=0x200[B]
+FSOpen: Open '\EFI\BOOT\BOOTX64.EFI' Success
+ArceOS UEFI helloworld
+```
+
+不应该出现：
+
+```text
+Unhandled #PF
+rewrite desc
+translated_queue_pfn
+```
+
+## 本次文档修改记录
+
+新增文件：
+
+- `axvisor-2026-notebooks/develop/virtio-blk-nested-dma/03-final-architecture-after-rebase.md`
+
+## 本次代码修改记录
+
+以下记录按文件和变量名定位，方便以后追 diff。
+
+- `tgoskits/virtualization/axdevice/Cargo.toml`
+  - 新增依赖 `axaddrspace`
+- `tgoskits/virtualization/axdevice/src/lib.rs`
+  - 新增导出 `pub mod virtio_blk`
+- `tgoskits/virtualization/axdevice/src/virtio_blk.rs`
+  - 新增 `LegacyVirtioBlk`
+  - 新增 `LegacyQueue`
+  - 新增 `VirtioBlkRequest`
+  - 新增 `Descriptor`
+  - 新增端口常量 `LEGACY_BLK_IO_BASE`、`LEGACY_BLK_IO_SIZE`
+  - 新增单元测试 `reports_capacity_from_installed_disk_image`
+  - 新增单元测试 `read_request_copies_sector_into_guest_buffer_and_publishes_used_ring`
+  - 新增单元测试 `write_request_updates_backend_and_reports_only_status_byte_used`
+- `tgoskits/virtualization/axvm/src/vm.rs`
+  - `AxVMInnerMut::ovmf_virtio_blk` 改为 `LegacyVirtioBlk`
+  - 新增 `AxVmGuestMemory`
+  - 新增 `impl GuestMemoryAccessor for AxVmGuestMemory`
+  - 新增 `AxVM::install_virtio_blk_disk_image()`
+  - `handle_ovmf_virtio_blk_io_read()` 改为调用 `LegacyVirtioBlk::handle_read()`
+  - `handle_ovmf_virtio_blk_io_write()` 改为调用 `LegacyVirtioBlk::handle_write()`
+  - `IoStringRead` 对 `FW_CFG_IO_DATA` 使用 `FwCfgState::read_bytes()`
+  - `IoStringRead` 和 `IoStringWrite` 按 `count * width.size()` 计算 guest buffer 字节数
+  - 删除旧符号 `OvmfVirtioBlkIoState`
+  - 删除旧函数 `translate_ovmf_virtio_blk_queue_pfn()`
+  - 删除旧函数 `rewrite_ovmf_virtio_blk_descriptors()`
+  - 删除旧函数 `dump_ovmf_virtio_blk_queue()`
+- `tgoskits/os/axvisor/src/images/mod.rs`
+  - 新增 `ImageLoader::load_virtio_blk_disk_from_filesystem()`
+  - `fs::read_image_file()` 改为 `pub(crate)`
+  - OVMF 分支消费 `loader.config.kernel.disk_path`
+  - 普通 filesystem image 分支也消费 `loader.config.kernel.disk_path`
+- `tgoskits/os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml`
+  - 新增 `kernel.disk_path`
+- `tgoskits/virtualization/x86_vcpu/src/svm/vcpu.rs`
+  - 新增 `OVMF_DEBUGCON_PORT`
+  - 新增 `FW_CFG_IO_BASE`
+  - 新增 `FW_CFG_DMA_IO_BASE`
+  - 新增 `OVMF_VIRTIO_BLK_IO_BASE`
+  - `setup_io_bitmap()` 补齐 debugcon、fw_cfg、fw_cfg DMA、virtio-blk 端口拦截
+  - `SvmExitCode::IOIO` 对 string I/O 生成 `AxVCpuExitReason::IoStringRead`
+  - `SvmExitCode::IOIO` 对 string I/O 生成 `AxVCpuExitReason::IoStringWrite`
+
+本次检查过的上游关键代码位置：
+
+- `tgoskits/virtualization/axaddrspace/src/memory_accessor.rs`
+  - `GuestMemoryAccessor`
+- `tgoskits/virtualization/axvm-types/src/lib.rs`
+  - `EmulatedDeviceType::VirtioBlk`
+  - `EmulatedDeviceType::X86IoApic`
+  - `EmulatedDeviceType::X86Pit`
+- `tgoskits/virtualization/axdevice/src/device.rs`
+  - `AxVmDevices`
+  - `AxVmDevices::x86_ioapic_assert_gsi()`
+  - `AxVmDevices::x86_ioapic_end_of_interrupt()`
+  - `BaseDeviceOps` 分发路径
+- `tgoskits/virtualization/axvm/src/vm.rs`
+  - `OvmfVirtioBlkIoState`
+  - `handle_ovmf_virtio_blk_io_read()`
+  - `handle_ovmf_virtio_blk_io_write()`
+  - `rewrite_ovmf_virtio_blk_descriptors()`
+  - `handle_fw_cfg_io_read()`
+  - `handle_fw_cfg_io_write()`
+- `tgoskits/os/axvisor/src/images/mod.rs`
+  - `ImageLoader::load_uefi_ovmf_images()`
+  - `VMKernelConfig::disk_path`
+- `references/cloud-hypervisor/virtio-devices/src/block.rs`
+  - block request 和 backend 边界
+- `references/cloud-hypervisor/vm-virtio/src/queue.rs`
+  - split queue 测试和内存布局
+
+## 本次验证记录
+
+最终跑过：
+
+```bash
+cargo test -p axdevice virtio_blk -- --nocapture
+cargo test -p axvm --lib
+cargo test -p x86_vcpu --lib
+cargo fmt --check --package axdevice --package axvm --package axvisor --package x86_vcpu
+cargo run --manifest-path xtask/Cargo.toml -- axvisor build --config os/axvisor/configs/board/qemu-x86_64.toml --vmconfigs os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml
+```
+
+结果：
+
+- `axdevice virtio_blk`：3 passed
+- `axvm --lib`：编译通过，0 tests
+- `x86_vcpu --lib`：61 passed
+- `cargo fmt --check`：通过
+- AxVisor OVMF 配置构建：通过，后端自动选择 `vmx`，最终验证时间 2026-06-14 13:39 CST
+
+另外跑过旧 hack 搜索：
+
+```bash
+rg "rewrite desc|rewrite_ovmf|translated_queue_pfn|translate_ovmf_virtio_blk_queue_pfn|OvmfVirtioBlkIoState" tgoskits/virtualization tgoskits/os
+```
+
+没有匹配项。
