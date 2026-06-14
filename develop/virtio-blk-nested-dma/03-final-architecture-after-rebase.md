@@ -399,3 +399,73 @@ rg "rewrite desc|rewrite_ovmf|translated_queue_pfn|translate_ovmf_virtio_blk_que
 ```
 
 没有匹配项。
+
+## 2026-06-14 真实启动后的修订
+
+这次不只跑 build，已经跑了外层 QEMU + AxVisor + 嵌套 OVMF。
+
+启动时不能把 `tmp/uefi-boot-test.img` 直接作为外层 `--rootfs`。这个镜像本身有 `EFI/BOOT/BOOTX64.EFI`，外层 OVMF 会先从它启动，结果看到的是宿主 OVMF 直接加载 helloworld，不是 AxVisor 启动嵌套 OVMF。
+
+正确关系是：
+
+- 外层 QEMU rootfs：`tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img`
+- rootfs 内嵌套盘：`/guest/disks/uefi-boot-test.img`
+- VM 配置字段：`kernel.disk_path = "/guest/disks/uefi-boot-test.img"`
+
+本次为了 smoke，把 `tmp/nested-uefi-disk.img` 写入了 Alpine rootfs：
+
+```bash
+debugfs -w -R 'mkdir /guest/disks' tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img
+debugfs -w -R 'write tmp/nested-uefi-disk.img /guest/disks/uefi-boot-test.img' \
+  tgoskits/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img
+```
+
+上游配置模型也变了。旧笔记里的 `boot = "uefi"` / `enable_bios = false` 会在 `axvmconfig` 阶段失败：
+
+```text
+boot_protocol requires enable_bios = true
+```
+
+现在的 OVMF 配置需要按上游字段写：
+
+- `tgoskits/os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml`
+  - `kernel.boot_protocol = "uefi"`
+  - `kernel.enable_bios = true`
+
+这里的 `enable_bios` 名字有历史包袱。对当前 `axvmconfig::VMKernelConfig::validate_boot_config()` 来说，它表示走固件类启动路径，不是说只能加载 SeaBIOS。
+
+还修了一个上游变基后暴露出的重复映射：
+
+- `tgoskits/virtualization/axvm/src/vm.rs`
+  - 删除 `AxVM::init()` 中旧的 `inner_mut.address_space.map_linear(GuestPhysAddr::from(0xfee0_0000), crate::vcpu::EmulatedLocalApic::virtual_apic_access_addr(), ...)`
+  - 保留后面的上游 VMX 条件映射：`X86_APIC_ACCESS_GPA` + `x86_apic_access_page_addr()`
+
+不删旧块时，VM 创建 vCPU 后会失败：
+
+```text
+Mapping error: AlreadyExists
+VM[1] setup failed: AxErrorKind::AlreadyExists
+```
+
+原因不是 virtio-blk，也不是 OVMF 固件窗口，而是同一个 APIC access GPA `0xfee0_0000` 被映射了两次。
+
+顺手清了一个 warning：
+
+- `tgoskits/virtualization/axvm/src/vcpu.rs`
+  - 删除未使用的 `pub use x86_vcpu::EmulatedLocalApic`
+
+这次真实启动看到的关键日志：
+
+```text
+Loading OVMF_CODE image from /guest/ovmf/OVMF_CODE.fd into GPA 0xffc84000
+Loading OVMF_VARS image from /guest/ovmf/OVMF_VARS.fd into GPA 0xffc00000
+Loading virtio-blk disk image from /guest/disks/uefi-boot-test.img (33554432 bytes)
+OVMF debugcon:  BlockSize : 512
+OVMF debugcon:  LastBlock : FFFF
+OVMF debugcon:  Valid primary and Valid backup partition table
+OVMF debugcon: FSOpen: Open '\EFI\BOOT\BOOTX64.EFI' Success
+ArceOS UEFI helloworld
+ArceOS UEFI shell-stage boot OK
+```
+
+这说明方向一的最小闭环已经走通：嵌套 OVMF 通过 AxVisor 内的 legacy virtio-blk 设备模型读到了 GPT/FAT 盘，并启动了 ESP 里的 UEFI 应用。
