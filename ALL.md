@@ -43,8 +43,34 @@ virtio-block 设备（通过 virtio-pci 暴露），能用来枚举磁盘并启�
 - develop文件夹,当前进展
 - /issue/mod0.md 目前需要理解为了让OVMF开始启动的所有修改路线（有时效性）
 - /issue/ing.md 是还需要继续进行对mod0的补充（规划不一定对）
+- /issue/ovmf-infra-roadmap.md OVMF适配查缺补漏文档
 - OVMF-go.md 是目前的详细规划由ai生成，self.md可以反应我检验到哪一步
 - OVMF-all.md 是OVMF大致模块规划
 
 # skill
 - /doc: 把当前的对话内容整理成文档（注意规范，不要以对话的形式）
+
+
+方向二(其他组的课题选择):
+方向二：设备与中断框架重构
+当前状态
+目前的设备与中断框架可以工作，但属于“拼接式”设计，扩展和维护成本较高：
+
+AxVmDevices 内部将设备按 MMIO、SysReg、Port 三类分别放进 Vec，访问时通过线性查找分发，效率和控制力都有限。
+添加一种新设备需要改动中心化的 EmulatedDeviceType 大枚举，并在各处补充 match 分支，这意味着“加一个设备”很容易触碰核心代码。
+中断注入的实现路径随架构散落在不同角落：AArch64 直接操作 VGIC / GICH / ICH 寄存器，RISC‑V 通过查找 vPLIC 设备并写 pending 位，LoongArch 写 CSR / GCSR，x86 则在 vCPU 里自行排队 pending event。VM 层面的通用接口（如 inject_interrupt_to_cpus）还挂着 TODO，vLAPIC 也有大量路径未真正实现。
+错误处理比较生硬：设备查找未命中就会 panic，很多地方还存在 unwrap、expect、todo!() 和 unimplemented!()，整体鲁棒性不足。
+目标
+将设备模型和中断模型从具体 VM 实现与架构特判中解耦出来，形成一套 “资源注册 + 总线路由 + IRQ 路由 + 后端抽象” 的统一框架：
+
+每个设备都能清晰声明自己的资源和能力：哪些 MMIO 区域、哪些 PIO 端口、哪些系统寄存器、占用哪些 IRQ 线、是否支持 MSI/MSI‑X、DMA、PCI BAR，以及 reset/suspend/resume 行为等。
+注册时统一进行资源冲突检查（地址范围重叠、总线类型匹配、IRQ 资源合法性、架构支持等）。
+VM exit 处理只抽象为统一的总线访问（BusAccess），不再直接关心“到哪个设备的哪张表里去查”。
+中断方面，提供 VM 级的 InterruptRouter / IrqSink 抽象：设备只发出 raise / lower / pulse / msi / eoi 等语义操作，路由器再根据架构分发给 vLAPIC/vIOAPIC、VGIC、vPLIC/AIA、LoongArch 虚拟中断控制器。如此一来，设备后端再也不需要直接调用特定架构 API，也不会通过“写另一个设备的 MMIO”来间接注入中断。
+技术实现路线
+定义统一的概念层 先抽象出基本类型和接口：DeviceId、Resource、BusKind、BusAccess、BusResponse、DeviceError、IrqLine、IrqTarget、InterruptControllerOps 等。原有的 BaseDeviceOps<R> 先通过适配器接入，降低一次性迁移的风险。
+升级设备容器为 DeviceRegistry + BusRouter 用带索引的注册表替代原来的 AxVmDevices<Vec>，按总线类型建立查找结构，并在注册时检测地址冲突。设备创建从集中式 match 大枚举改为工厂/注册机制，以后再新增 virtio、串口、IOAPIC、AIA/IMSIC、LoongArch 中断控制器等设备时，就不再需要修改核心容器代码。
+统一 VM exit 分发 将 MmioRead/Write、IoRead/Write、SysRegRead/Write 统一转换为总线事务（bus transaction），由路由器统一返回结果或结构化错误。未命中、非法访问宽度、对只读寄存器的写操作等都不再直接 panic，而是返回可处理的错误信息。
+引入 VM 级 IRQ 路由器 各设备后端改为持有 IrqSink，不再直接触碰架构相关代码。RISC‑V 的 vPLIC 仍然可以通过显式 set_pending 来工作，但这一操作只发生在路由器内部。AArch64 的 VGIC 通过封装 LR（List Register）注入，与设备解耦。x86 一侧则整理出清晰的 vLAPIC、vIOAPIC、MSI 路由路径。LoongArch 先用 CSR 后端作为过渡适配。
+借助大模型辅助设计（但代码必须扎实） 我们可以利用大模型系统性比较 QEMU/KVM、crosvm、Firecracker、ACRN 等项目的设备与中断抽象，辅助生成 trait 草案、配置 schema、负例测试、迁移清单和能力矩阵。最终落地时，所有接口仍必须是强类型 API，并通过单元测试和冒烟测试充分验证，不依赖“模型直接生成的代码”。
+补齐测试矩阵 围绕重构中容易出错的环节建立密集测试：地址范围冲突检查、总线未命中、访问宽度违规、只读寄存器写入保护、sysreg/port 范围越界、vPLIC claim/complete 流程、VGIC LR 满时的行为、vLAPIC timer/IPI/EOI 正确性、SMP IPI、timer tick、直通设备与仿真设备范围重叠防护等。 通过这套测试，不仅能保证重构后架构更清晰优雅，也能为后续支持 x86_64 UEFI 客户机这种设备拓扑更复杂的场景打下可靠基础。
