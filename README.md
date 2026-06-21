@@ -1,99 +1,91 @@
 # axvisor-2026-notebooks
 
-这个仓库是 AxVisor x86_64 OVMF/UEFI 适配的工作笔记。它不负责构建 AxVisor，也不保存 EDK2 源码。真正的代码仓库在同一工作区里的 `tgoskits/` 和 `edk2/`。
+AxVisor x86_64 OVMF/UEFI guest bring-up 的工作笔记和调试记录。
 
-当前主线是让 AxVisor 能启动标准 OVMF 固件，并沿着 UEFI 路径加载最小 guest。这个过程会补到一批原来在 AxVisor 里不完整的 PC 平台基础设施，包括 UEFI 配置链路、OVMF 镜像加载、fw_cfg、MSR/APIC 虚拟化、PCI MMIO、virtio-blk、ACPI PM I/O 和 UEFI payload。
+代码在同工作区的 `tgoskits/`（AxVisor）和 `edk2/`（OVMF 固件）。本目录只放文档，不参与构建。
 
-## 当前状态
+## 项目目标
 
-已经验证的最小链路是：
+让 AxVisor 能启动标准 OVMF 固件，沿 UEFI 路径加载 guest。过程中补齐 AxVisor 缺失的 x86 PC 平台基础设施：UEFI 配置链路、fw_cfg、MSR/APIC 虚拟化、PCI MMIO、legacy virtio-blk、ACPI 转发、PIT/PIC 中断模型。
 
-```text
-AxVisor
-  -> OVMF_CODE / OVMF_VARS
-  -> x86 reset vector
-  -> OVMF SEC / PEI / DXE / BDS
-  -> PCI / virtio-blk
-  -> FAT32 ESP
-  -> /EFI/BOOT/BOOTX64.EFI
-  -> ArceOS UEFI helloworld
+当前已验证的完整链路：
+
+```
+AxVisor → OVMF_CODE/VARS → x86 reset vector → SEC/PEI/DXE/BDS
+→ legacy virtio-blk → FAT32 ESP → /EFI/BOOT/BOOTX64.EFI
+→ ArceOS UEFI helloworld
 ```
 
-这说明 OVMF 已经能越过早期固件阶段，进入 BDS，从 virtio-blk 上读取 ESP，并加载一个 PE32+ UEFI 应用。它还不是完整 Linux EFI 启动，也不是完整 PC 平台模型。
+在此基础上已开始 Linux UEFI guest 启动尝试，当前卡在 timer/APIC 中断投递路径（详见 `develop/linux-uefi-timer-apic/`）。
 
-当前最新工作在 `develop/develop7-UEFI-ArceOS.md`。
+## 目录结构
 
-## 先读什么
-
-| 目的 | 文档 |
-|---|---|
-| 跑当前 smoke 流程 | `start.md` |
-| 了解总任务和仓库使用方式 | `ALL.md` |
-| 看 OVMF 启动阶段 | `docs/OVMF-Boot-Overview.md` |
-| 看 TOML 到 VM 的配置消费链路 | `develop/config-chain.md` |
-| 看团队模块认领和欠账整理 | `issue/ovmf-infra-roadmap.md` |
-| 看最新进展 | `develop/develop7-UEFI-ArceOS.md` |
-
-`issue/ing.md` 只能当作历史草稿参考。判断事实、写新总结或拆任务时，以 `develop/` 里的阶段记录和当前代码为准。
-
-## 目录说明
-
-```text
+```
 .
-├── ALL.md                         总任务和文档地图
-├── start.md                       当前可执行的 OVMF/UEFI 运行手册
-├── develop/                       按时间推进的调试和实现记录
-├── docs/                          背景资料、启动流程和规划材料
-└── issue/                         面向协作和 issue/report 的压缩总结
+├── start.md                 运行手册（QEMU 命令、镜像布局、常见问题）
+├── ALL.md                   总任务地图
+├── develop/                 调试和实现的阶段记录（事实来源）
+├── docs/                    背景资料（OVMF 启动流程、x86 手册索引）
+├── issue/                   面向协作的压缩总结和进展报告
+└── subagent_watch/          外部模型审计输出
 ```
 
-`develop/` 是事实来源。每个阶段记录应该说明看到了什么日志或源码逻辑、判断是什么、改了哪里、验证结果是什么。
+## develop/
 
-`docs/` 更偏背景材料。这里的文档可以解释 OVMF 阶段、UEFI 路径、x86 架构资料和早期规划，但不一定代表最新实现状态。
+按时间顺序记录每个调试阶段：看到了什么日志或源码、判断是什么、改了哪里、验证结果如何。
 
-`issue/` 用来放给团队协作看的高层整理。这里的内容应该能帮助成员认领模块、定位当前污染代码和理解基础设施目标，不应该变成过细的实现方案。
+| 目录/文件 | 内容 |
+|---|---|
+| `develop0.md` ~ `develop7-UEFI-ArceOS.md` | OVMF 从 reset vector 到 ArceOS helloworld 的逐步推进 |
+| `develop8-fwcfg-extract.md`, `develop9-fwcfg-content-model.md` | fw_cfg 从 vm.rs 提取到 axdevice，内容模型整理 |
+| `virtio-blk-nested-dma/`（10 份文档） | virtio-blk 从 vm.rs 特殊路径到 axdevice 设备模型的完整重构过程 |
+| `uefi-acpi-passthrough/` | 外层 QEMU ACPI fw_cfg blob 转发到嵌套 guest |
+| `linux-uefi-pf-diagnostics/` | Linux EFI stub 早期 #PF 诊断（已越过） |
+| `linux-uefi-timer-apic/`（4 份文档） | Linux timer/APIC：PIT reset、LINT0 路由、PIC 8259、ISR stuck 修复、当前 inject 传递问题 |
 
-## develop 阅读顺序
+阅读顺序建议：先读 `start.md` 了解怎么跑，再按 `develop0` 到 `develop7` 看 OVMF 主线，然后按需读 `virtio-blk-nested-dma/` 和 `linux-uefi-timer-apic/`。
 
-| 顺序 | 文档 | 主题 |
-|---|---|---|
-| 0 | `develop/develop0.md` | reset vector、早期异常、DEBUG OVMF |
-| 1 | `develop/develop1.md` | debugcon、fw_cfg 早期定位 |
-| 2 | `develop/develop2.md` | 最小 fw_cfg、string I/O workaround |
-| 3 | `develop/develop3.md` | MTRR / MSR 最小虚拟化 |
-| 4 | `develop/develop4-msr.md` | APIC_BASE、x2APIC、DXE/BDS 停点 |
-| 5 | `develop/develop5.md` | CPUID guest 视图、xAPIC MMIO、AP startup |
-| 6 | `develop/develop6-BDS.md` | BDS、virtio-blk、ESP、UEFI app 加载 |
-| 7 | `develop/develop7-UEFI-ArceOS.md` | ArceOS UEFI app 和后续 runtime 接入边界 |
+## issue/
 
-`develop/config-chain.md` 不属于阶段推进，但它对理解 OVMF 加载很重要。改 TOML 字段、镜像加载、vCPU 初始入口前，先读它。
+| 文件 | 内容 |
+|---|---|
+| `ovmf-infra-roadmap.md` | 14 个模块的基础设施清单，每个说明 OVMF 阶段、bring-up 角色、当前适配状态、代码位置 |
+| `ovmf-progress-2026-05-06.md` | 近期进展总结（virtio-blk 重构、fw_cfg 提取、ACPI 转发、Linux 启动尝试） |
+| `ing.md` | 早期欠账草稿，仅供参考 |
+| `mod0/`, `mod1/` | 模块级详细报告 |
 
-## 当前边界
+## subagent_watch/
 
-- 默认验证目标是 `smp1`。
-- 当前 smoke 目标是 ArceOS UEFI helloworld，不是 Linux EFI。
-- OVMF/EDK2 逻辑代码原则上不应为了 AxVisor 适配而修改。已有例外主要是 debug 输出和 fw_cfg 读取路径上的诊断性改动。
-- 现在有些代码是为了最小跑通写的 workaround。整理到上游 PR 前，需要先分清它是基础设施雏形、临时透传、诊断日志，还是应该删除的污染代码。
-- 上游合入标准不在这个 notebook 仓库里定义。这里负责记录事实、说明目标、给出定位和协作上下文。
+外部模型的审计输出，按主题分组：
 
-## 维护约定
+- **APIC/PIC 合同**：`linux-lvt0-write-path-audit.md`、`vmx-apic-write-path-contract.md`、`virtual-wire-extint-contract-matrix.md`、`intel-vmx-apic-access-contract.md`
+- **PIT/timer 诊断**：`linux-check-timer-pit-pic-window.md`、`reference-pit-pic-extint-window-contract.md`、`axvisor-pit-poll-window-audit.md`
+- **virtio-blk 协议**：`virtio-blk-audit-prompt1~4-*.md`、`mature-irq0-chain-comparison.md`
+- **ACPI/IRQ 边界**：`acpi-platform-forwarding-evidence.md`、`uefi-irq-acpi-platform-boundary.md`
 
-- 新推进的调试过程写进 `develop/`，按阶段追加，不要只写结论。
-- 运行方式、镜像位置、预期日志发生变化时，同步更新 `start.md`。
-- 面向团队认领的总结写进 `issue/`，保持高层，不替认领者决定具体实现。
-- 总结当前实现时标注来源，例如 `develop4 Step 6`。
-- 不把 `issue/ing.md` 当事实来源。
-- 写文档时优先用当前代码路径和可复现日志，不写猜测成分。
+## docs/
+
+| 文件 | 内容 |
+|---|---|
+| `OVMF-Boot-Overview.md` | OVMF 启动阶段概览 |
+| `virtio-blk-device-model.md` | virtio-blk 设备模型参考 |
+| `x86_64/inode.md` | Intel x86 SDM 页码索引，按需更新 |
 
 ## 工作区关系
 
-默认工作区大致是：
-
-```text
+```
 <workspace>/
-├── axvisor-2026-notebooks/        本仓库
-├── tgoskits/                      AxVisor / ArceOS 代码
-└── edk2/                          OVMF / UEFI 固件代码
+├── axvisor-2026-notebooks/     本目录（文档）
+├── tgoskits/                   AxVisor / ArceOS 代码
+│   └── references/             上游参考实现（QEMU、Cloud Hypervisor）
+└── edk2/                       OVMF / UEFI 固件代码
 ```
 
-运行 AxVisor 时优先看 `start.md`。修改 AxVisor 代码前，先确认对应阶段记录里写的最新停点；如果日志已经变化，先更新判断，再动代码。
+## 使用约定
+
+- `develop/` 是事实来源。写新总结或拆任务前，先读相关 develop 记录。
+- `issue/` 是面向人的摘要，不作为判断依据。
+- 每次有意义的调试推进，同步到 `develop/` 再切上下文。
+- OVMF/EDK2 源码不做逻辑修改（debug 输出和 fw_cfg 读入除外）。
+- 借鉴 `references/` 下的成熟实现，不自己发明大框架。
+- 运行方式、镜像位置、预期日志变化时，同步更新 `start.md`。
