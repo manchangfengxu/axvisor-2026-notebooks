@@ -181,8 +181,8 @@ tgoskits/virtualization/axdevice/src/virtio_blk.rs
 AxVM 只保留胶水：
 
 - `AxVMInnerMut::ovmf_virtio_blk: LegacyVirtioBlk`
-- `struct AxVmGuestMemory<'a>`
-- `impl GuestMemoryAccessor for AxVmGuestMemory<'_>`
+- `struct AxVmGuestMemory`
+- `impl GuestMemoryAccessor for AxVmGuestMemory`
 - `AxVM::install_virtio_blk_disk_image()`
 - `AxVM::handle_ovmf_virtio_blk_io_read()`
 - `AxVM::handle_ovmf_virtio_blk_io_write()`
@@ -201,7 +201,7 @@ OVMF out 0x6010
   -> LegacyQueue::publish_used()
 ```
 
-本阶段仍然不注入中断。OVMF legacy virtio-blk 路径可以 polling，之前 smoke 已经验证过这点。等读盘稳定后，再用 `AxVmDevices::x86_ioapic_assert_gsi()` 补 INTx。
+当前恢复阶段仍然不注入中断。OVMF legacy virtio-blk 路径可以 polling，之前 smoke 已经验证过这点。下一步局部标准化阶段不应继续依赖 polling，应按下文 INTx 路径复用 `AxVmDevices::x86_ioapic_assert_gsi()`。
 
 ## 和方向二的兼容边界
 
@@ -228,6 +228,160 @@ DeviceContext::guest_memory
 ```
 
 设备内部的 virtqueue、request、backend 逻辑不用重写。
+
+## 下一步局部标准化设计
+
+方向一继续推进，但不要继续把 OVMF smoke 需要的逻辑堆进 `axvm`。目标是在当前架构能承受的范围内，把设备核心写成标准 hypervisor 设备模型；方向二重构成熟后，只替换 VM 侧 glue，不重写 virtqueue、request、backend 和基础设备语义。
+
+### 1. virtio-blk 核心保持设备化
+
+当前正确边界：
+
+- `tgoskits/virtualization/axdevice/src/virtio_blk.rs`
+  - `LegacyVirtioBlk`
+  - `LegacyQueue`
+  - `VirtioBlkRequest`
+  - `Descriptor`
+
+这些符号不应该依赖 `AxVM`、vCPU、OVMF 或 VM-exit。它们只通过 `GuestMemoryAccessor` 读写 guest memory。
+
+下一步完善点：
+
+- `LegacyVirtioBlk::handle_write()` 在 `REG_QUEUE_NOTIFY` 后应返回是否发布了 used buffer，方便上层触发 INTx。
+- `LegacyVirtioBlk` 增加 legacy ISR status 语义，至少支持 queue used bit。
+- `VirtioBlkRequest` 继续只处理标准请求：`VIRTIO_BLK_T_IN`、`VIRTIO_BLK_T_OUT`、`VIRTIO_BLK_T_GET_ID`。
+- `LegacyQueue` 继续保存 GPA 视角的 queue 状态，禁止恢复 descriptor GPA->HPA 原地改写。
+
+后续如果文件变大，再拆为：
+
+- `tgoskits/virtualization/axdevice/src/virtio/queue.rs`
+  - `LegacyQueue`
+  - `Descriptor`
+- `tgoskits/virtualization/axdevice/src/virtio_blk.rs`
+  - `LegacyVirtioBlk`
+  - `VirtioBlkRequest`
+
+现在不需要为了拆而拆。
+
+### 2. AxVM 只保留临时 adapter
+
+当前 adapter 定位：
+
+- `tgoskits/virtualization/axvm/src/vm.rs`
+  - `AxVMInnerMut::ovmf_virtio_blk`
+  - `AxVmGuestMemory`
+  - `AxVM::install_virtio_blk_disk_image()`
+  - `AxVM::handle_ovmf_virtio_blk_io_read()`
+  - `AxVM::handle_ovmf_virtio_blk_io_write()`
+
+这些符号可以短期存在，但职责只能是：
+
+- 持有设备实例。
+- 把 VM exit 的 PIO 访问转给设备。
+- 构造 `AxVmGuestMemory`。
+- 在设备完成请求后接现有 x86 IRQ 注入路径。
+
+不应该再加入：
+
+- virtqueue descriptor 解析。
+- block request 解析。
+- disk sector 读写逻辑。
+- OVMF 专用状态机。
+
+方向二之后，以上 adapter 应替换为：
+
+```text
+DeviceContext::guest_memory
+DeviceContext::irq_sink
+BusRouter::pio_dispatch()
+```
+
+但 `LegacyVirtioBlk` 内部逻辑不应改。
+
+### 3. INTx 应依托现有 vIOAPIC
+
+不要长期依赖 OVMF polling。当前已有基础设施：
+
+- `tgoskits/virtualization/axdevice/src/device.rs`
+  - `AxVmDevices::x86_ioapic_assert_gsi()`
+  - `AxVmDevices::x86_ioapic_end_of_interrupt()`
+- `tgoskits/virtualization/axvm/src/runtime/x86_irq.rs`
+  - `inject_pending_ioapic_irq_after_eoi()`
+  - `inject_due_pit_irq0()`
+  - `inject_pending_serial_irq()`
+- `tgoskits/virtualization/x86_vlapic/src/vioapic.rs`
+  - `EmulatedIoApic::assert_gsi()`
+  - `EmulatedIoApic::end_of_interrupt()`
+
+推荐最小路径：
+
+```text
+OVMF out 0x6010
+  -> AxVM::handle_ovmf_virtio_blk_io_write()
+  -> LegacyVirtioBlk::handle_write()
+  -> LegacyQueue::publish_used()
+  -> LegacyVirtioBlk sets ISR queue bit
+  -> AxVmDevices::x86_ioapic_assert_gsi(virtio_blk_gsi)
+  -> vcpu.inject_interrupt_with_trigger()
+```
+
+注意：当前 `tgoskits/os/axvisor/configs/vms/ovmf-x86_64-qemu-smp1.toml` 里 `emu_devices = []`，还没有把 `X86IoApic` 接入这个 OVMF VM。补 INTx 前要先让配置和设备模型一致。
+
+### 4. PCI 先定义边界，不抢完整实现
+
+当前 `LEGACY_BLK_IO_BASE = 0x6000` 能让 OVMF smoke 跑通，但它不是完整 virtio-pci 发现路径。
+
+短期可接受定位：
+
+- `tgoskits/virtualization/axdevice/src/virtio_blk.rs`
+  - `LEGACY_BLK_IO_BASE`
+  - `LEGACY_BLK_IO_SIZE`
+
+把它称为 legacy virtio-blk PIO transport，不要称为完整 virtio-pci。
+
+更标准的下一步是最小 PCI config：
+
+- 一个 root bus。
+- 一个 virtio-blk function。
+- 一个 I/O BAR 指向 `0x6000..0x607f`。
+- 一个 INTx pin/line。
+
+这部分应尽量独立于 `LegacyVirtioBlk` 核心。未来方向二做 `BusRouter` 或 PCI bus 时，只替换 config/BAR 注册路径。
+
+### 5. fw_cfg 和 ACPI PM 不继续留在 vm.rs
+
+当前还在 `axvm` 中：
+
+- `tgoskits/virtualization/axvm/src/vm.rs`
+  - `FwCfgState`
+  - `AxVM::handle_fw_cfg_io_read()`
+  - `AxVM::handle_fw_cfg_io_write()`
+  - `AxVM::handle_fw_cfg_dma()`
+  - `AxVM::handle_acpi_pm_io_read()`
+  - `AxVM::handle_acpi_pm_io_write()`
+
+下一步应整理成 x86 platform device：
+
+- `fw_cfg` 作为 QEMU fw_cfg port/DMA 设备，继续支持 selector、data port、DMA read、file directory、`etc/e820`。
+- `acpi_pm` 先实现最小 PM1_CNT/PM1_STS/PM timer 语义，不继续 host port passthrough。
+- `debugcon` 保持普通 port device，避免同时在 `AxVmDevices` 和 `AxVM::run()` 中重复特判 `0x402`。
+
+方向二之后，这些设备应接入统一 bus；但设备寄存器语义本身不应重写。
+
+### 6. 不在本阶段引入的东西
+
+本阶段不要提前实现：
+
+- 通用 `DeviceContext`。
+- 通用 `BusAccess` / `BusRouter`。
+- 通用 `IrqSink`。
+- async worker / eventfd。
+- MSI / MSI-X。
+- packed queue。
+- multi-queue。
+- modern virtio-pci capability。
+
+这些要么属于方向二，要么属于 Linux EFI 完整启动后续阶段。当前只保证 OVMF bring-up 所需路径按标准设备语义收敛。
 
 ## 可以借鉴的现成实现
 

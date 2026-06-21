@@ -32,6 +32,10 @@ virtio-block 设备（通过 virtio-pci 暴露），能用来枚举磁盘并启�
 完善 x86 中断链路 短期：利用 vIOAPIC + INTx 让 virtio-pci 的基本中断跑通。 中期：完善 vLAPIC 的 EOI、IPI、timer 以及 MSI/MSI-X 支持。目前 x86_vcpu 中已经有 pending event 和 vLAPIC 雏形，但还未能串成完整的 IRQ 数据通路，需要把它们连起来并填补缺失逻辑。
 建立验证闭环 新建一个专门的 x86_64 UEFI 客户机配置，并编写对应的 QEMU 冒烟测试。验证路径从 OVMF 的 UEFI Shell 开始，逐步到通过 Linux EFI stub 和 virtio-block 启动完整内核。目前 qemu-x86_64.toml 中仍标记为 uefi = false，我们需要将其升级为真正的 UEFI 启动测试。
 
+# 当前进展
+我们已经完成了最小ovmf加载客户机路径的适配,但是只做到了运行arceos helloword镜像后开始停止.之前的修复完善面向ovmf的输出日志,面向结果的最小修复.基本堆在了axvm模块里,现在我们开始进行之前的完善.
+参考`axvisor-2026-notebooks/issue/ovmf-infra-roadmap.md`,这是在没有开始完善任何基础设施之前写的.
+note: 方向二对于我们的当下开发必不可少,但是方向二不是我们组在进行的,且无法认为可以基于别人方向二设计的框架.同时axvisor现有基础设施并非是完善的.我们不应该为axvisor补全难度较大的基础设施,而是在现有基础设施上实现一个相对标准的为ovmf 客户机加载而需要完善的基础设施.但是如果需要适配ovmf加载而让axvisor完善的一些基础设施工程量不大,则可以借鉴其他项目,依托axvisor现有架构进行完善.`references`里有cloud-hypervisor,和qemu
 
 # 文档指南
 - axvisor-2026/start.md下是如何启动axvisor，可以根据需要进行修改
@@ -40,7 +44,7 @@ virtio-block 设备（通过 virtio-pci 暴露），能用来枚举磁盘并启�
 - docs/inode 官方知识索引
 - self.md，我手动总结的最简洁的规划，包括一定的原理解释，能反映目前进行到哪一步
 - config-chain.md 目前需要理解，反应从toml->配置链路->axvisor了解的关键地方，也是OVMF加载关键（有时效性）
-- develop文件夹,当前进展
+- develop文件夹,描述当前进展,当前修改
 - /issue/mod0.md 目前需要理解为了让OVMF开始启动的所有修改路线（有时效性）
 - /issue/ing.md 是还需要继续进行对mod0的补充（规划不一定对）
 - /issue/ovmf-infra-roadmap.md OVMF适配查缺补漏文档
